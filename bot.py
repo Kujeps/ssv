@@ -165,6 +165,14 @@ def touch_funnel(user: User, stage: str) -> None:
         )
 
 
+def had_started_before(user_id: int) -> bool:
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        row = db.execute(
+            "SELECT started_at FROM funnel WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return bool(row and row[0])
+
+
 def get_stats() -> dict:
     with closing(sqlite3.connect(DB_PATH)) as db:
         row = db.execute(
@@ -457,9 +465,26 @@ def admin_text(app_id: int, user: User, data: dict) -> str:
 
 # ---------- обработчики ----------
 
+async def notify_start(bot: Bot, user: User, is_new: bool) -> None:
+    label = "🆕 Новый пользователь запустил бота" if is_new else "🔁 Пользователь снова нажал /start"
+    username = f"@{user.username}" if user.username else "нет username"
+    text = (
+        f"▶️ <b>{label}</b>\n\n"
+        f"👤 <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a> · {escape(username)}\n"
+        f"ID: <code>{user.id}</code>"
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            logging.exception("Не удалось отправить уведомление о /start админу %s", admin_id)
+
+
 @dp.message(CommandStart())
 async def on_start(message: Message, state: FSMContext, bot: Bot) -> None:
+    is_new = not had_started_before(message.from_user.id)
     touch_funnel(message.from_user, "started_at")
+    await notify_start(bot, message.from_user, is_new)
     await clear_prev(bot, message.chat.id, await state.get_data())
     await state.clear()
     await message.answer(GREETING, reply_markup=apply_keyboard())
