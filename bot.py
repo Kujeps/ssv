@@ -76,10 +76,14 @@ UNITS = [
 GENDERS = ["Мужской", "Женский"]
 SERVED = ["Не служил(а)", "Срочная служба", "Служба по контракту"]
 CALL_TIMES = ["Утро (9–12)", "День (12–17)", "Вечер (17–21)", "В любое время"]
-CHOICES = {"gender": GENDERS, "unit": UNITS, "served": SERVED, "call_time": CALL_TIMES}
+MEDICAL = ["Да", "Нет"]
+CHOICES = {
+    "gender": GENDERS, "medical": MEDICAL, "unit": UNITS,
+    "served": SERVED, "call_time": CALL_TIMES,
+}
 
 # Шаги, которые нельзя пропустить. Остальные можно (но нужен хотя бы один контакт).
-REQUIRED_STEPS = {"name", "gender", "age", "city", "unit"}
+REQUIRED_STEPS = {"name", "gender", "medical", "age", "city", "unit"}
 
 # Статусы заявок: ключ -> (значок, название).
 STATUSES = {
@@ -108,6 +112,7 @@ class Form(StatesGroup):
     max = State()
     wa = State()
     gender = State()
+    medical = State()
     age = State()
     city = State()
     unit = State()
@@ -125,8 +130,15 @@ class Broadcast(StatesGroup):
 # Порядок шагов анкеты и соответствие шаг -> состояние.
 STEPS = [
     "name", "phone", "tg", "max", "wa",
-    "gender", "age", "city", "unit", "served", "call_time", "comment",
+    "gender", "medical", "age", "city", "unit", "served", "call_time", "comment",
 ]
+# Шаги, которые задаются не всем: шаг -> условие по уже введённым данным.
+CONDITIONAL_STEPS = {"medical": lambda data: data.get("gender") == GENDERS[1]}
+
+
+def active_steps(data: dict) -> list[str]:
+    """Шаги анкеты для конкретного человека (без неподходящих по условию)."""
+    return [s for s in STEPS if s not in CONDITIONAL_STEPS or CONDITIONAL_STEPS[s](data)]
 STEP_STATES = {step: getattr(Form, step) for step in STEPS}
 CONTACT_KEYS = ["phone", "tg", "max", "wa"]
 LAST_CONTACT_STEP = "wa"
@@ -138,6 +150,7 @@ FIELDS = [
     ("max", "💬", "MAX"),
     ("wa", "🟢", "WhatsApp"),
     ("gender", "⚥", "Пол"),
+    ("medical", "🩺", "Мед. образование"),
     ("age", "🎂", "Возраст"),
     ("city", "📍", "Город"),
     ("unit", "🎖", "Подразделение"),
@@ -163,6 +176,10 @@ PROMPTS = {
     "max": "💬 <b>MAX</b>\n\nУкажите номер телефона или ссылку на ваш профиль в MAX.",
     "wa": "🟢 <b>WhatsApp</b>\n\nУкажите номер, на котором есть WhatsApp.",
     "gender": "⚥ <b>Ваш пол</b>\n\nВыберите вариант.",
+    "medical": (
+        "🩺 <b>Есть ли у вас медицинское образование?</b>\n\n"
+        "Выберите вариант или напишите подробнее — например, «фельдшер» или «медсестра»."
+    ),
     "age": "🎂 <b>Сколько вам полных лет?</b>\n\nНапишите число, например: <code>27</code>",
     "city": "📍 <b>Город или регион, где вы находитесь</b>\n\nНапример: <code>Самара</code>",
     "unit": (
@@ -185,6 +202,7 @@ ERRORS = {
     "max": "Укажите номер телефона или ссылку/ник в MAX.",
     "wa": "Не похоже на номер телефона. Пример: <code>+7 999 123-45-67</code>",
     "gender": "Выберите вариант кнопкой под вопросом: «Мужской» или «Женский».",
+    "medical": "Слишком длинно — сократите, пожалуйста, до 100 символов.",
     "age": (
         f"Служба по контракту доступна от {MIN_AGE} до {MAX_AGE} лет. "
         "Проверьте, пожалуйста, возраст и напишите число."
@@ -276,6 +294,7 @@ def init_db() -> None:
         # получают статус «Новая», остальные новые поля у них пустые.
         ensure_columns(db, "applications", {
             "gender": "TEXT",
+            "medical": "TEXT",
             "age": "INTEGER",
             "city": "TEXT",
             "unit": "TEXT",
@@ -410,13 +429,13 @@ def save_application(user: User, data: dict) -> int:
         cur = db.execute(
             "INSERT INTO applications"
             " (user_id, username, full_name, name, phone, telegram, max_contact, whatsapp,"
-            "  gender, age, city, unit, served, call_time, comment, source)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  gender, medical, age, city, unit, served, call_time, comment, source)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user.id, user.username, user.full_name,
                 data.get("name"), data.get("phone"), data.get("tg"),
                 data.get("max"), data.get("wa"),
-                data.get("gender"), int(age) if age else None, data.get("city"),
+                data.get("gender"), data.get("medical"), int(age) if age else None, data.get("city"),
                 data.get("unit"), data.get("served"), data.get("call_time"),
                 data.get("comment"), row[0] if row else None,
             ),
@@ -526,7 +545,7 @@ def safe_cell(value):
 
 EXPORT_COLUMNS = [
     ("#", 5), ("Дата и время", 17), ("Имя", 16), ("Телефон", 16), ("Telegram", 14),
-    ("MAX", 14), ("WhatsApp", 14), ("Пол", 10), ("Возраст", 9), ("Город", 16),
+    ("MAX", 14), ("WhatsApp", 14), ("Пол", 10), ("Мед. образование", 16), ("Возраст", 9), ("Город", 16),
     ("Подразделение", 20), ("Служба ранее", 18), ("Удобное время", 16),
     ("Комментарий клиента", 30), ("Источник", 14), ("Статус", 16), ("Менеджер", 16),
     ("Статус изменён", 17), ("Заметки менеджера", 40), ("Профиль", 20),
@@ -555,7 +574,7 @@ def build_export_xlsx() -> BytesIO:
         status = a["status"] or "new"
         ws.append([safe_cell(v) for v in [
             a["id"], fmt_ts(a["created_at"], "%d.%m.%Y %H:%M"), a["name"], a["phone"],
-            a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["age"], a["city"],
+            a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["medical"], a["age"], a["city"],
             a["unit"], a["served"], a["call_time"], a["comment"], a["source"],
             STATUSES.get(status, STATUSES["new"])[1],
             a["status_by"] if status != "new" else "",
@@ -645,6 +664,7 @@ NORMALIZERS = {
     "max": norm_max,
     "wa": norm_wa,
     "gender": norm_gender,
+    "medical": text_normalizer(1, 100),
     "age": norm_age,
     "city": text_normalizer(2, 100),
     "unit": text_normalizer(2, 100),
@@ -661,14 +681,18 @@ def parse_source(arg: str | None) -> str | None:
 
 # ---------- оформление ----------
 
-def header(i: int) -> str:
-    bar = "●" * (i + 1) + "○" * (len(STEPS) - i - 1)
-    return f"<b>Шаг {i + 1} из {len(STEPS)}</b>  {bar}"
+def header(step: str, data: dict) -> str:
+    steps = active_steps(data)
+    i = steps.index(step)
+    bar = "●" * (i + 1) + "○" * (len(steps) - i - 1)
+    return f"<b>Шаг {i + 1} из {len(steps)}</b>  {bar}"
 
 
 def card(data: dict, skip_empty: bool = False) -> str:
     lines = []
     for key, icon, label in FIELDS:
+        if key in CONDITIONAL_STEPS and not CONDITIONAL_STEPS[key](data):
+            continue
         value = data.get(key)
         if value:
             lines.append(f"{icon} <b>{label}:</b> {escape(str(value))}")
@@ -702,7 +726,7 @@ def choice_rows(step: str) -> list[list[InlineKeyboardButton]]:
 
 
 def step_keyboard(step: str, data: dict, user: User) -> InlineKeyboardMarkup:
-    i = STEPS.index(step)
+    i = active_steps(data).index(step)
     rows = []
     if step == "name" and user.first_name:
         rows.append([btn(f"👋 Меня зовут {user.first_name}", "use:name")])
@@ -765,7 +789,7 @@ def lead_text(app: dict) -> str:
     data = {
         "name": app["name"], "phone": app["phone"], "tg": app["telegram"],
         "max": app["max_contact"], "wa": app["whatsapp"], "gender": app["gender"],
-        "age": app["age"], "city": app["city"], "unit": app["unit"],
+        "medical": app["medical"], "age": app["age"], "city": app["city"], "unit": app["unit"],
         "served": app["served"], "call_time": app["call_time"], "comment": app["comment"],
     }
     username = f"@{app['username']}" if app["username"] else "нет username"
@@ -850,7 +874,7 @@ async def clear_prev(bot: Bot, chat_id: int, data: dict) -> None:
 async def show_step(bot: Bot, chat_id: int, state: FSMContext, step: str, user: User) -> None:
     data = await state.get_data()
     await clear_prev(bot, chat_id, data)
-    text = f"{header(STEPS.index(step))}\n\n{PROMPTS[step]}"
+    text = f"{header(step, data)}\n\n{PROMPTS[step]}"
     markup = phone_keyboard() if step == "phone" else step_keyboard(step, data, user)
     msg = await bot.send_message(chat_id, text, reply_markup=markup)
     await state.set_state(STEP_STATES[step])
@@ -870,8 +894,10 @@ async def save_and_next(
     bot: Bot, chat_id: int, state: FSMContext, user: User, step: str, value: str | None
 ) -> None:
     await state.update_data(**{step: value})
+    if step == "gender" and value != GENDERS[1]:
+        await state.update_data(medical=None)  # вопрос только для женщин
+    data = await state.get_data()
     if step == LAST_CONTACT_STEP:
-        data = await state.get_data()
         if not any(data.get(k) for k in CONTACT_KEYS):
             await bot.send_message(
                 chat_id,
@@ -879,18 +905,17 @@ async def save_and_next(
             )
             await show_step(bot, chat_id, state, "phone", user)
             return
-    i = STEPS.index(step)
-    if i + 1 < len(STEPS):
-        await show_step(bot, chat_id, state, STEPS[i + 1], user)
+    steps = active_steps(data)
+    i = steps.index(step)
+    if i + 1 < len(steps):
+        await show_step(bot, chat_id, state, steps[i + 1], user)
     else:
         await show_confirm(bot, chat_id, state)
 
 
 async def go_back(bot: Bot, chat_id: int, state: FSMContext, user: User, step: str) -> None:
-    if step == "confirm":
-        prev = STEPS[-1]
-    else:
-        prev = STEPS[max(STEPS.index(step) - 1, 0)]
+    steps = active_steps(await state.get_data())
+    prev = steps[-1] if step == "confirm" else steps[max(steps.index(step) - 1, 0)]
     await show_step(bot, chat_id, state, prev, user)
 
 
