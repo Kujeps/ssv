@@ -4,15 +4,15 @@ import os
 import re
 import sqlite3
 from contextlib import closing, suppress
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html import escape
 from io import BytesIO
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -25,8 +25,10 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    ReactionTypeEmoji,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    ReplyParameters,
     User,
 )
 from dotenv import load_dotenv
@@ -35,12 +37,68 @@ from openpyxl.styles import Font
 
 load_dotenv()
 
+
+def env_ids(name: str) -> list[int]:
+    return [int(x) for x in os.getenv(name, "").replace(" ", "").split(",") if x]
+
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_CHAT_IDS", "").replace(" ", "").split(",") if x]
-ADMIN_USER_IDS = [
-    int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x
-]
+# Чаты, куда уходят готовые заявки (группа менеджеров).
+ADMIN_IDS = env_ids("ADMIN_CHAT_IDS")
+ADMIN_CHAT_SET = set(ADMIN_IDS)
+# Админы бота: /stats, /export, /broadcast и уведомления о /start (в личке с ботом).
+ADMIN_USER_IDS = env_ids("ADMIN_USER_IDS")
+# Кто может менять статусы заявок и оставлять заметки. Пусто = любой участник группы заявок.
+MANAGER_IDS = env_ids("MANAGER_IDS")
 DB_PATH = os.getenv("DB_PATH", "leads.db")
+# Часовой пояс для времени в карточках и Excel (смещение от UTC, по умолчанию Москва).
+LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "3"))))
+# Напоминать о необработанной заявке через N минут (0 — выключить), не более REMIND_MAX раз.
+REMIND_AFTER_MIN = int(os.getenv("REMIND_AFTER_MIN", "30"))
+REMIND_MAX = 3
+
+
+# ---------- настройки анкеты (при необходимости правятся здесь) ----------
+
+MIN_AGE, MAX_AGE = 18, 65
+
+UNITS = [
+    "Сухопутные войска",
+    "ВДВ",
+    "ВМФ",
+    "ВКС",
+    "Артиллерия / ракетные",
+    "Беспилотные системы",
+    "Связь / РЭБ",
+    "Медицинская служба",
+    "Не определился — подскажите",
+]
+GENDERS = ["Мужской", "Женский"]
+SERVED = ["Не служил(а)", "Срочная служба", "Служба по контракту"]
+CALL_TIMES = ["Утро (9–12)", "День (12–17)", "Вечер (17–21)", "В любое время"]
+CHOICES = {"gender": GENDERS, "unit": UNITS, "served": SERVED, "call_time": CALL_TIMES}
+
+# Шаги, которые нельзя пропустить. Остальные можно (но нужен хотя бы один контакт).
+REQUIRED_STEPS = {"name", "gender", "age", "city", "unit"}
+
+# Статусы заявок: ключ -> (значок, название).
+STATUSES = {
+    "new": ("🆕", "Новая"),
+    "work": ("🔧", "В работе"),
+    "nocall": ("📵", "Не дозвонились"),
+    "agreed": ("✅", "Согласился"),
+    "refused": ("❌", "Отказался"),
+    "junk": ("🗑", "Мусор"),
+}
+STATUS_BUTTONS = {
+    "work": "🔧 Беру в работу",
+    "nocall": "📵 Не дозвонились",
+    "agreed": "✅ Согласился",
+    "refused": "❌ Отказался",
+    "junk": "🗑 Мусор / спам",
+    "new": "↩️ Вернуть в новые",
+}
+STATUS_BUTTON_ORDER = ["work", "nocall", "agreed", "refused", "junk", "new"]
 
 
 class Form(StatesGroup):
@@ -49,6 +107,13 @@ class Form(StatesGroup):
     tg = State()
     max = State()
     wa = State()
+    gender = State()
+    age = State()
+    city = State()
+    unit = State()
+    served = State()
+    call_time = State()
+    comment = State()
     confirm = State()
 
 
@@ -58,9 +123,13 @@ class Broadcast(StatesGroup):
 
 
 # Порядок шагов анкеты и соответствие шаг -> состояние.
-STEPS = ["name", "phone", "tg", "max", "wa"]
+STEPS = [
+    "name", "phone", "tg", "max", "wa",
+    "gender", "age", "city", "unit", "served", "call_time", "comment",
+]
 STEP_STATES = {step: getattr(Form, step) for step in STEPS}
 CONTACT_KEYS = ["phone", "tg", "max", "wa"]
+LAST_CONTACT_STEP = "wa"
 
 FIELDS = [
     ("name", "👤", "Имя"),
@@ -68,11 +137,19 @@ FIELDS = [
     ("tg", "✈️", "Telegram"),
     ("max", "💬", "MAX"),
     ("wa", "🟢", "WhatsApp"),
+    ("gender", "⚥", "Пол"),
+    ("age", "🎂", "Возраст"),
+    ("city", "📍", "Город"),
+    ("unit", "🎖", "Подразделение"),
+    ("served", "🪖", "Служба ранее"),
+    ("call_time", "🕒", "Удобное время для звонка"),
+    ("comment", "💭", "Комментарий"),
 ]
 
 GREETING = (
     "👋 <b>Здравствуйте, оставьте заявку и мы свяжемся с вами!</b>\n\n"
-    "Это займёт меньше минуты — всего несколько простых шагов."
+    "Это займёт пару минут — несколько простых вопросов.\n\n"
+    "<i>Нажимая «Оставить заявку», вы соглашаетесь на обработку персональных данных.</i>"
 )
 
 PROMPTS = {
@@ -85,6 +162,20 @@ PROMPTS = {
     "tg": "✈️ <b>Telegram</b>\n\nНапишите ваш @ник или ссылку на профиль.",
     "max": "💬 <b>MAX</b>\n\nУкажите номер телефона или ссылку на ваш профиль в MAX.",
     "wa": "🟢 <b>WhatsApp</b>\n\nУкажите номер, на котором есть WhatsApp.",
+    "gender": "⚥ <b>Ваш пол</b>\n\nВыберите вариант.",
+    "age": "🎂 <b>Сколько вам полных лет?</b>\n\nНапишите число, например: <code>27</code>",
+    "city": "📍 <b>Город или регион, где вы находитесь</b>\n\nНапример: <code>Самара</code>",
+    "unit": (
+        "🎖 <b>Желаемое подразделение</b>\n\n"
+        "Выберите из списка или напишите своё. "
+        "Если ещё не определились — выберите последний пункт, менеджер подскажет."
+    ),
+    "served": "🪖 <b>Служили ли вы ранее?</b>\n\nВыберите вариант или напишите подробнее.",
+    "call_time": "🕒 <b>Когда вам удобно принять звонок?</b>\n\nВыберите вариант или напишите своё время.",
+    "comment": (
+        "💭 <b>Хотите что-то добавить?</b>\n\n"
+        "Вопросы, пожелания, особенности — всё, что поможет менеджеру. Можно пропустить."
+    ),
 }
 
 ERRORS = {
@@ -93,6 +184,16 @@ ERRORS = {
     "tg": "Не получилось разобрать ник. Пример: <code>@username</code>",
     "max": "Укажите номер телефона или ссылку/ник в MAX.",
     "wa": "Не похоже на номер телефона. Пример: <code>+7 999 123-45-67</code>",
+    "gender": "Выберите вариант кнопкой под вопросом: «Мужской» или «Женский».",
+    "age": (
+        f"Служба по контракту доступна от {MIN_AGE} до {MAX_AGE} лет. "
+        "Проверьте, пожалуйста, возраст и напишите число."
+    ),
+    "city": "Напишите название города или региона (от 2 до 100 символов).",
+    "unit": "Выберите подразделение из списка или напишите его название (до 100 символов).",
+    "served": "Слишком длинно — сократите, пожалуйста, до 200 символов.",
+    "call_time": "Слишком длинно — сократите, пожалуйста, до 100 символов.",
+    "comment": "Слишком длинно — сократите, пожалуйста, до 500 символов.",
 }
 
 BTN_SHARE = "📱 Поделиться номером"
@@ -102,13 +203,41 @@ BTN_BACK = "⬅️ Назад"
 bot_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# Анкета заполняется только в личке. Всё, что пишут в группах, бот игнорирует:
-# в группу он лишь отправляет готовые заявки через send_message.
-dp.message.filter(F.chat.type == ChatType.PRIVATE)
-dp.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+# Два роутера: анкета и админ-команды работают только в личке с ботом,
+# а в группе заявок бот реагирует лишь на кнопки статусов и заметки менеджеров.
+leads = Router(name="leads")
+private = Router(name="private")
+private.message.filter(F.chat.type == ChatType.PRIVATE)
+private.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+dp.include_router(leads)
+dp.include_router(private)
+
+
+# ---------- время ----------
+
+def local_dt(ts: str | None) -> datetime | None:
+    """Время из SQLite (UTC) -> локальное время."""
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
+    except ValueError:
+        return None
+
+
+def fmt_ts(ts: str | None, pattern: str = "%d.%m %H:%M") -> str:
+    dt = local_dt(ts)
+    return dt.strftime(pattern) if dt else ""
 
 
 # ---------- база ----------
+
+def ensure_columns(db: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
 
 def init_db() -> None:
     with closing(sqlite3.connect(DB_PATH)) as db, db:
@@ -139,25 +268,77 @@ def init_db() -> None:
                 full_name TEXT,
                 started_at TEXT,
                 started_form_at TEXT,
-                completed_at TEXT,
-                blocked_at TEXT
+                completed_at TEXT
             )
             """
         )
-        # Миграция для баз, созданных до появления столбца blocked_at.
-        cols = {row[1] for row in db.execute("PRAGMA table_info(funnel)")}
-        if "blocked_at" not in cols:
-            db.execute("ALTER TABLE funnel ADD COLUMN blocked_at TEXT")
+        # Миграции: столбцы, появившиеся после первых версий. Старые заявки
+        # получают статус «Новая», остальные новые поля у них пустые.
+        ensure_columns(db, "applications", {
+            "gender": "TEXT",
+            "age": "INTEGER",
+            "city": "TEXT",
+            "unit": "TEXT",
+            "served": "TEXT",
+            "call_time": "TEXT",
+            "comment": "TEXT",
+            "source": "TEXT",
+            "status": "TEXT DEFAULT 'new'",
+            "status_by": "TEXT",
+            "status_by_id": "INTEGER",
+            "status_at": "TEXT",
+            "reminded_at": "TEXT",
+            "remind_count": "INTEGER DEFAULT 0",
+        })
+        ensure_columns(db, "funnel", {"blocked_at": "TEXT", "source": "TEXT"})
+        # Карточки заявок в группе (по ним ищем заявку при нажатии кнопок и ответах).
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_messages (
+                app_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+            """
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_lead_messages_app ON lead_messages (app_id)")
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                by_id INTEGER,
+                by_name TEXT,
+                text TEXT
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS status_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                status TEXT,
+                by_id INTEGER,
+                by_name TEXT
+            )
+            """
+        )
 
 
-def touch_funnel(user: User, stage: str) -> None:
+def touch_funnel(user: User, stage: str, source: str | None = None) -> None:
     assert stage in ("started_at", "started_form_at", "completed_at")
     with closing(sqlite3.connect(DB_PATH)) as db, db:
+        # Источник (метка рекламы) запоминается по первому заходу с меткой.
         db.execute(
-            "INSERT INTO funnel (user_id, username, full_name) VALUES (?, ?, ?)"
+            "INSERT INTO funnel (user_id, username, full_name, source) VALUES (?, ?, ?, ?)"
             " ON CONFLICT(user_id) DO UPDATE SET username = excluded.username,"
-            " full_name = excluded.full_name",
-            (user.id, user.username, user.full_name),
+            " full_name = excluded.full_name,"
+            " source = COALESCE(funnel.source, excluded.source)",
+            (user.id, user.username, user.full_name, source),
         )
         db.execute(
             f"UPDATE funnel SET {stage} = COALESCE({stage}, CURRENT_TIMESTAMP) WHERE user_id = ?",
@@ -184,6 +365,16 @@ def get_stats() -> dict:
             " FROM funnel"
         ).fetchone()
         total_apps = db.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
+        by_status = dict(db.execute(
+            "SELECT COALESCE(status, 'new'), COUNT(*) FROM applications GROUP BY 1"
+        ).fetchall())
+        sources = db.execute(
+            "SELECT COALESCE(source, ''),"
+            " COUNT(*) FILTER (WHERE started_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE started_form_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE completed_at IS NOT NULL)"
+            " FROM funnel GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
+        ).fetchall()
     started, started_form, completed, blocked = row
     return {
         "started": started,
@@ -191,6 +382,8 @@ def get_stats() -> dict:
         "completed": completed,
         "blocked": blocked,
         "total_apps": total_apps,
+        "by_status": by_status,
+        "sources": sources,
     }
 
 
@@ -210,50 +403,174 @@ def mark_blocked(user_id: int) -> None:
         )
 
 
-def build_export_xlsx() -> BytesIO:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Заявки"
-    headers = [
-        "#", "Дата и время", "Имя", "Телефон", "Telegram", "MAX", "WhatsApp",
-        "Профиль", "Username", "User ID",
-    ]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        rows = db.execute(
-            "SELECT id, created_at, name, phone, telegram, max_contact, whatsapp,"
-            " full_name, username, user_id FROM applications ORDER BY id"
-        ).fetchall()
-    for app_id, created_at, name, phone, tg, max_c, wa, full_name, username, user_id in rows:
-        ws.append([
-            app_id, created_at, name, phone, tg, max_c, wa,
-            full_name, f"@{username}" if username else "", user_id,
-        ])
-    widths = [5, 19, 16, 16, 14, 14, 14, 20, 14, 12]
-    for i, width in enumerate(widths, start=1):
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
-    ws.freeze_panes = "A2"
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
-
-
 def save_application(user: User, data: dict) -> int:
+    age = data.get("age")
     with closing(sqlite3.connect(DB_PATH)) as db, db:
+        row = db.execute("SELECT source FROM funnel WHERE user_id = ?", (user.id,)).fetchone()
         cur = db.execute(
             "INSERT INTO applications"
-            " (user_id, username, full_name, name, phone, telegram, max_contact, whatsapp)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " (user_id, username, full_name, name, phone, telegram, max_contact, whatsapp,"
+            "  gender, age, city, unit, served, call_time, comment, source)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user.id, user.username, user.full_name,
                 data.get("name"), data.get("phone"), data.get("tg"),
                 data.get("max"), data.get("wa"),
+                data.get("gender"), int(age) if age else None, data.get("city"),
+                data.get("unit"), data.get("served"), data.get("call_time"),
+                data.get("comment"), row[0] if row else None,
             ),
         )
         return cur.lastrowid
+
+
+def get_application(app_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM applications WHERE id = ?", (app_id,)).fetchone()
+        if row is None:
+            return None
+        notes = db.execute(
+            "SELECT by_name, text, created_at FROM lead_notes WHERE app_id = ? ORDER BY id",
+            (app_id,),
+        ).fetchall()
+    app = dict(row)
+    app["status"] = app["status"] or "new"
+    app["notes"] = [dict(n) for n in notes]
+    return app
+
+
+def save_lead_message(app_id: int, chat_id: int, message_id: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as db, db:
+        db.execute(
+            "INSERT OR REPLACE INTO lead_messages (app_id, chat_id, message_id) VALUES (?, ?, ?)",
+            (app_id, chat_id, message_id),
+        )
+
+
+def lead_message_refs(app_id: int) -> list[tuple[int, int]]:
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        return db.execute(
+            "SELECT chat_id, message_id FROM lead_messages WHERE app_id = ?", (app_id,)
+        ).fetchall()
+
+
+def find_app_by_message(chat_id: int, message_id: int) -> int | None:
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        row = db.execute(
+            "SELECT app_id FROM lead_messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def set_status(app_id: int, status: str, user: User) -> bool | None:
+    """True — статус изменён, False — уже был таким, None — заявки нет."""
+    with closing(sqlite3.connect(DB_PATH)) as db, db:
+        row = db.execute(
+            "SELECT COALESCE(status, 'new') FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row[0] == status:
+            return False
+        db.execute(
+            "UPDATE applications SET status = ?, status_by = ?, status_by_id = ?,"
+            " status_at = CURRENT_TIMESTAMP, remind_count = 0, reminded_at = NULL WHERE id = ?",
+            (status, user.full_name, user.id, app_id),
+        )
+        db.execute(
+            "INSERT INTO status_history (app_id, status, by_id, by_name) VALUES (?, ?, ?, ?)",
+            (app_id, status, user.id, user.full_name),
+        )
+    return True
+
+
+def add_note(app_id: int, user: User, text: str) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as db, db:
+        db.execute(
+            "INSERT INTO lead_notes (app_id, by_id, by_name, text) VALUES (?, ?, ?, ?)",
+            (app_id, user.id, user.full_name, text),
+        )
+
+
+def due_reminders() -> list[tuple[int, int, int, int]]:
+    """Заявки со статусом «Новая», которые ждут дольше REMIND_AFTER_MIN минут."""
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        return db.execute(
+            "SELECT a.id, m.chat_id, m.message_id,"
+            " CAST((julianday('now') - julianday(a.created_at)) * 1440 AS INTEGER)"
+            " FROM applications a JOIN lead_messages m ON m.app_id = a.id"
+            " WHERE COALESCE(a.status, 'new') = 'new'"
+            " AND COALESCE(a.remind_count, 0) < ?"
+            " AND COALESCE(a.reminded_at, a.created_at) <= datetime('now', ?)",
+            (REMIND_MAX, f"-{REMIND_AFTER_MIN} minutes"),
+        ).fetchall()
+
+
+def mark_reminded(app_ids: set[int]) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as db, db:
+        db.executemany(
+            "UPDATE applications SET remind_count = COALESCE(remind_count, 0) + 1,"
+            " reminded_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [(i,) for i in app_ids],
+        )
+
+
+def safe_cell(value):
+    """Строки, начинающиеся с «=», Excel считал бы формулой — экранируем."""
+    if isinstance(value, str) and value.startswith("="):
+        return "'" + value
+    return value
+
+
+EXPORT_COLUMNS = [
+    ("#", 5), ("Дата и время", 17), ("Имя", 16), ("Телефон", 16), ("Telegram", 14),
+    ("MAX", 14), ("WhatsApp", 14), ("Пол", 10), ("Возраст", 9), ("Город", 16),
+    ("Подразделение", 20), ("Служба ранее", 18), ("Удобное время", 16),
+    ("Комментарий клиента", 30), ("Источник", 14), ("Статус", 16), ("Менеджер", 16),
+    ("Статус изменён", 17), ("Заметки менеджера", 40), ("Профиль", 20),
+    ("Username", 14), ("User ID", 12),
+]
+
+
+def build_export_xlsx() -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Заявки"
+    ws.append([name for name, _ in EXPORT_COLUMNS])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        db.row_factory = sqlite3.Row
+        apps = db.execute("SELECT * FROM applications ORDER BY id").fetchall()
+        notes: dict[int, list[str]] = {}
+        for n in db.execute(
+            "SELECT app_id, by_name, text, created_at FROM lead_notes ORDER BY id"
+        ):
+            notes.setdefault(n["app_id"], []).append(
+                f"{n['by_name']} ({fmt_ts(n['created_at'])}): {n['text']}"
+            )
+    for a in apps:
+        status = a["status"] or "new"
+        ws.append([safe_cell(v) for v in [
+            a["id"], fmt_ts(a["created_at"], "%d.%m.%Y %H:%M"), a["name"], a["phone"],
+            a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["age"], a["city"],
+            a["unit"], a["served"], a["call_time"], a["comment"], a["source"],
+            STATUSES.get(status, STATUSES["new"])[1],
+            a["status_by"] if status != "new" else "",
+            fmt_ts(a["status_at"], "%d.%m.%Y %H:%M") if status != "new" else "",
+            "\n".join(notes.get(a["id"], [])),
+            a["full_name"], f"@{a['username']}" if a["username"] else "", a["user_id"],
+        ]])
+    for i, (_, width) in enumerate(EXPORT_COLUMNS, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 # ---------- проверка введённых значений ----------
@@ -297,7 +614,49 @@ def norm_name(text: str) -> str | None:
     return text if 1 <= len(text) <= 60 else None
 
 
-NORMALIZERS = {"name": norm_name, "phone": norm_phone, "tg": norm_tg, "max": norm_max, "wa": norm_wa}
+def norm_gender(text: str) -> str | None:
+    t = text.strip().lower()
+    if t in ("м", "муж", "мужской", "мужчина"):
+        return GENDERS[0]
+    if t in ("ж", "жен", "женский", "женщина"):
+        return GENDERS[1]
+    return None
+
+
+def norm_age(text: str) -> str | None:
+    m = re.fullmatch(r"\D*(\d{1,3})\D*", text.strip())
+    if not m:
+        return None
+    age = int(m.group(1))
+    return str(age) if MIN_AGE <= age <= MAX_AGE else None
+
+
+def text_normalizer(min_len: int, max_len: int):
+    def norm(text: str) -> str | None:
+        text = text.strip()
+        return text if min_len <= len(text) <= max_len else None
+    return norm
+
+
+NORMALIZERS = {
+    "name": norm_name,
+    "phone": norm_phone,
+    "tg": norm_tg,
+    "max": norm_max,
+    "wa": norm_wa,
+    "gender": norm_gender,
+    "age": norm_age,
+    "city": text_normalizer(2, 100),
+    "unit": text_normalizer(2, 100),
+    "served": text_normalizer(1, 200),
+    "call_time": text_normalizer(1, 100),
+    "comment": text_normalizer(1, 500),
+}
+
+
+def parse_source(arg: str | None) -> str | None:
+    """Метка рекламы из ссылки t.me/бот?start=метка."""
+    return arg if arg and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", arg) else None
 
 
 # ---------- оформление ----------
@@ -312,7 +671,7 @@ def card(data: dict, skip_empty: bool = False) -> str:
     for key, icon, label in FIELDS:
         value = data.get(key)
         if value:
-            lines.append(f"{icon} <b>{label}:</b> {escape(value)}")
+            lines.append(f"{icon} <b>{label}:</b> {escape(str(value))}")
         elif not skip_empty:
             lines.append(f"{icon} <b>{label}:</b> —")
     return "\n".join(lines)
@@ -320,6 +679,26 @@ def card(data: dict, skip_empty: bool = False) -> str:
 
 def btn(text: str, cb: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=cb)
+
+
+def choice_rows(step: str) -> list[list[InlineKeyboardButton]]:
+    """Варианты ответа: короткие по два в ряд, длинные — каждый в своей строке."""
+    rows, pair = [], []
+    for n, label in enumerate(CHOICES[step]):
+        b = btn(label, f"pick:{n}")
+        if len(label) > 22:
+            if pair:
+                rows.append(pair)
+                pair = []
+            rows.append([b])
+        else:
+            pair.append(b)
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+    if pair:
+        rows.append(pair)
+    return rows
 
 
 def step_keyboard(step: str, data: dict, user: User) -> InlineKeyboardMarkup:
@@ -331,10 +710,12 @@ def step_keyboard(step: str, data: dict, user: User) -> InlineKeyboardMarkup:
         rows.append([btn(f"✈️ Мой @{user.username}", "use:tg")])
     if step in ("max", "wa") and data.get("phone"):
         rows.append([btn(f"📞 Тот же номер {data['phone']}", "use:phone")])
+    if step in CHOICES:
+        rows.extend(choice_rows(step))
     nav = []
     if i > 0:
         nav.append(btn(BTN_BACK, "back"))
-    if step != "name":
+    if step not in REQUIRED_STEPS:
         nav.append(btn(BTN_SKIP, "skip"))
     if nav:
         rows.append(nav)
@@ -376,6 +757,81 @@ def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+# ---------- карточка заявки в группе ----------
+
+def lead_text(app: dict) -> str:
+    status = app["status"]
+    icon, label = STATUSES.get(status, STATUSES["new"])
+    data = {
+        "name": app["name"], "phone": app["phone"], "tg": app["telegram"],
+        "max": app["max_contact"], "wa": app["whatsapp"], "gender": app["gender"],
+        "age": app["age"], "city": app["city"], "unit": app["unit"],
+        "served": app["served"], "call_time": app["call_time"], "comment": app["comment"],
+    }
+    username = f"@{app['username']}" if app["username"] else "нет username"
+    lines = [
+        f"📋 <b>Заявка #{app['id']}</b> · {icon} {label}",
+        "",
+        card(data, skip_empty=True),
+        "",
+        f"🔗 <a href=\"tg://user?id={app['user_id']}\">{escape(app['full_name'] or '—')}</a>"
+        f" · {escape(username)} · ID <code>{app['user_id']}</code>",
+    ]
+    if app["source"]:
+        lines.append(f"🔖 Источник: <code>{escape(app['source'])}</code>")
+    if status != "new":
+        lines += [
+            "",
+            f"{icon} <b>{label}</b> — {escape(app['status_by'] or '—')} · {fmt_ts(app['status_at'])}",
+        ]
+    notes = app["notes"][-5:]
+    if notes:
+        lines += ["", "📝 <b>Заметки:</b>"]
+        for n in notes:
+            lines.append(
+                f"• <b>{escape(n['by_name'] or '—')}</b> ({fmt_ts(n['created_at'])}): {escape(n['text'])}"
+            )
+    return "\n".join(lines)
+
+
+def lead_keyboard(app_id: int, current: str) -> InlineKeyboardMarkup:
+    buttons = [
+        btn(STATUS_BUTTONS[key], f"st:{app_id}:{key}")
+        for key in STATUS_BUTTON_ORDER
+        if key != current
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    )
+
+
+async def send_lead_cards(bot: Bot, app_id: int) -> None:
+    app = get_application(app_id)
+    text, markup = lead_text(app), lead_keyboard(app_id, app["status"])
+    for chat_id in ADMIN_IDS:
+        try:
+            msg = await bot.send_message(chat_id, text, reply_markup=markup)
+            save_lead_message(app_id, chat_id, msg.message_id)
+        except Exception:
+            logging.exception("Не удалось отправить заявку в чат %s", chat_id)
+
+
+async def refresh_cards(bot: Bot, app_id: int) -> None:
+    app = get_application(app_id)
+    if app is None:
+        return
+    text, markup = lead_text(app), lead_keyboard(app_id, app["status"])
+    for chat_id, message_id in lead_message_refs(app_id):
+        with suppress(TelegramBadRequest):
+            await bot.edit_message_text(
+                text, chat_id=chat_id, message_id=message_id, reply_markup=markup
+            )
+
+
+def can_manage(user_id: int) -> bool:
+    return not MANAGER_IDS or user_id in MANAGER_IDS or user_id in ADMIN_USER_IDS
+
+
 # ---------- движок анкеты ----------
 
 async def clear_prev(bot: Bot, chat_id: int, data: dict) -> None:
@@ -414,19 +870,20 @@ async def save_and_next(
     bot: Bot, chat_id: int, state: FSMContext, user: User, step: str, value: str | None
 ) -> None:
     await state.update_data(**{step: value})
+    if step == LAST_CONTACT_STEP:
+        data = await state.get_data()
+        if not any(data.get(k) for k in CONTACT_KEYS):
+            await bot.send_message(
+                chat_id,
+                "⚠️ Нужен хотя бы один способ связи — укажите телефон, Telegram, MAX или WhatsApp.",
+            )
+            await show_step(bot, chat_id, state, "phone", user)
+            return
     i = STEPS.index(step)
     if i + 1 < len(STEPS):
         await show_step(bot, chat_id, state, STEPS[i + 1], user)
-        return
-    data = await state.get_data()
-    if not any(data.get(k) for k in CONTACT_KEYS):
-        await bot.send_message(
-            chat_id,
-            "⚠️ Нужен хотя бы один способ связи — укажите телефон, Telegram, MAX или WhatsApp.",
-        )
-        await show_step(bot, chat_id, state, "phone", user)
-        return
-    await show_confirm(bot, chat_id, state)
+    else:
+        await show_confirm(bot, chat_id, state)
 
 
 async def go_back(bot: Bot, chat_id: int, state: FSMContext, user: User, step: str) -> None:
@@ -453,19 +910,78 @@ async def guard(cb: CallbackQuery, state: FSMContext) -> dict | None:
     return data
 
 
-def admin_text(app_id: int, user: User, data: dict) -> str:
-    username = f"@{user.username}" if user.username else "нет username"
-    return (
-        f"🆕 <b>Новая заявка #{app_id}</b>\n\n"
-        f"{card(data, skip_empty=True)}\n\n"
-        f"🔗 <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a> · "
-        f"{escape(username)} · ID <code>{user.id}</code>"
-    )
+# ---------- группа заявок: статусы и заметки ----------
+
+@leads.callback_query(F.data.startswith("st:"), F.message.chat.id.in_(ADMIN_CHAT_SET))
+async def on_status(cb: CallbackQuery, bot: Bot) -> None:
+    if not can_manage(cb.from_user.id):
+        await cb.answer("У вас нет прав менять статусы", show_alert=True)
+        return
+    try:
+        _, app_id_str, status = cb.data.split(":")
+        app_id = int(app_id_str)
+    except ValueError:
+        await cb.answer()
+        return
+    if status not in STATUSES:
+        await cb.answer()
+        return
+    changed = set_status(app_id, status, cb.from_user)
+    if changed is None:
+        await cb.answer("Заявка не найдена", show_alert=True)
+        return
+    icon, label = STATUSES[status]
+    await cb.answer(f"{icon} {label}" if changed else "Этот статус уже стоит")
+    await refresh_cards(bot, app_id)
 
 
-# ---------- обработчики ----------
+@leads.message(
+    F.chat.id.in_(ADMIN_CHAT_SET), F.reply_to_message, F.text, ~F.text.startswith("/")
+)
+async def on_note(message: Message, bot: Bot) -> None:
+    """Ответ менеджера на карточку заявки сохраняется как заметка к ней."""
+    if message.from_user is None or not can_manage(message.from_user.id):
+        return
+    app_id = find_app_by_message(message.chat.id, message.reply_to_message.message_id)
+    if app_id is None:
+        return
+    add_note(app_id, message.from_user, message.text.strip()[:300])
+    await refresh_cards(bot, app_id)
+    with suppress(Exception):
+        await message.react([ReactionTypeEmoji(emoji="👍")])
 
-async def notify_start(bot: Bot, user: User, is_new: bool) -> None:
+
+async def send_reminders(bot: Bot) -> None:
+    done: set[int] = set()
+    for app_id, chat_id, message_id, waited in due_reminders():
+        try:
+            await bot.send_message(
+                chat_id,
+                f"⏰ <b>Заявка #{app_id}</b> без обработки уже {waited} мин. "
+                "Нажмите «Беру в работу» под карточкой.",
+                reply_parameters=ReplyParameters(
+                    message_id=message_id, allow_sending_without_reply=True
+                ),
+            )
+        except Exception:
+            logging.exception("Не удалось отправить напоминание по заявке %s", app_id)
+        done.add(app_id)
+    if done:
+        mark_reminded(done)
+
+
+async def reminder_loop(bot: Bot) -> None:
+    while True:
+        try:
+            await send_reminders(bot)
+        except Exception:
+            logging.exception("Ошибка проверки напоминаний")
+        await asyncio.sleep(60)
+
+
+# ---------- личка: анкета и админ-команды ----------
+
+async def notify_start(bot: Bot, user: User, is_new: bool, source: str | None) -> None:
     label = "🆕 Новый пользователь запустил бота" if is_new else "🔁 Пользователь снова нажал /start"
     username = f"@{user.username}" if user.username else "нет username"
     text = (
@@ -473,6 +989,8 @@ async def notify_start(bot: Bot, user: User, is_new: bool) -> None:
         f"👤 <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a> · {escape(username)}\n"
         f"ID: <code>{user.id}</code>"
     )
+    if source:
+        text += f"\n🔖 Источник: <code>{escape(source)}</code>"
     for admin_id in ADMIN_USER_IDS:
         try:
             await bot.send_message(admin_id, text)
@@ -480,17 +998,20 @@ async def notify_start(bot: Bot, user: User, is_new: bool) -> None:
             logging.exception("Не удалось отправить уведомление о /start админу %s", admin_id)
 
 
-@dp.message(CommandStart())
-async def on_start(message: Message, state: FSMContext, bot: Bot) -> None:
+@private.message(CommandStart())
+async def on_start(
+    message: Message, state: FSMContext, bot: Bot, command: CommandObject
+) -> None:
+    source = parse_source(command.args)
     is_new = not had_started_before(message.from_user.id)
-    touch_funnel(message.from_user, "started_at")
-    await notify_start(bot, message.from_user, is_new)
+    touch_funnel(message.from_user, "started_at", source)
+    await notify_start(bot, message.from_user, is_new, source)
     await clear_prev(bot, message.chat.id, await state.get_data())
     await state.clear()
     await message.answer(GREETING, reply_markup=apply_keyboard())
 
 
-@dp.message(Command("cancel"))
+@private.message(Command("cancel"))
 async def on_cancel_cmd(message: Message, state: FSMContext, bot: Bot) -> None:
     current = await state.get_state()
     if current in (Broadcast.waiting.state, Broadcast.confirm.state):
@@ -502,7 +1023,11 @@ async def on_cancel_cmd(message: Message, state: FSMContext, bot: Bot) -> None:
     await message.answer("🚫 Заявка отменена.", reply_markup=apply_keyboard())
 
 
-@dp.message(Command("stats"))
+def pct(part: int, whole: int) -> str:
+    return f"{part / whole:.0%}" if whole else "—"
+
+
+@private.message(Command("stats"))
 async def on_stats(message: Message) -> None:
     if message.from_user.id not in ADMIN_USER_IDS:
         return
@@ -510,24 +1035,42 @@ async def on_stats(message: Message) -> None:
     started, started_form, completed, blocked = (
         s["started"], s["started_form"], s["completed"], s["blocked"]
     )
+    by_status = s["by_status"]
+    workable = s["total_apps"] - by_status.get("junk", 0)
+    agreed = by_status.get("agreed", 0)
 
-    def pct(part: int, whole: int) -> str:
-        return f"{part / whole:.0%}" if whole else "—"
-
-    await message.answer(
-        "📊 <b>Статистика бота</b>\n\n"
-        f"🚀 Запустили бота: <b>{started}</b>\n"
-        f"📝 Начали заполнять заявку: <b>{started_form}</b> ({pct(started_form, started)} от запустивших)\n"
+    lines = [
+        "📊 <b>Статистика бота</b>",
+        "",
+        f"🚀 Запустили бота: <b>{started}</b>",
+        f"📝 Начали заполнять заявку: <b>{started_form}</b> ({pct(started_form, started)} от запустивших)",
         f"✅ Завершили заявку: <b>{completed}</b> ({pct(completed, started_form)} от начавших, "
-        f"{pct(completed, started)} от запустивших)\n"
-        f"🚫 Заблокировали бота: <b>{blocked}</b> ({pct(blocked, started)} от запустивших)\n\n"
-        f"📨 Всего заявок отправлено: <b>{s['total_apps']}</b>\n\n"
-        "<i>Блокировку бот узнаёт только при попытке написать пользователю "
-        "(например, во время рассылки), поэтому число может быть занижено.</i>"
+        f"{pct(completed, started)} от запустивших)",
+        f"🚫 Заблокировали бота: <b>{blocked}</b> ({pct(blocked, started)} от запустивших)",
+        "",
+        f"📨 Всего заявок отправлено: <b>{s['total_apps']}</b>",
+        "",
+        "📋 <b>Заявки по статусам</b>",
+    ]
+    for key, (icon, label) in STATUSES.items():
+        lines.append(f"{icon} {label}: <b>{by_status.get(key, 0)}</b>")
+    lines.append(
+        f"🎯 Согласились: <b>{agreed}</b> из {workable} ({pct(agreed, workable)}, без учёта мусора)"
     )
+    if s["sources"]:
+        lines += ["", "🔖 <b>Источники</b> <i>(запустили → начали → подали)</i>"]
+        for source, st, fm, done in s["sources"]:
+            name = escape(source) if source else "без метки"
+            lines.append(f"<code>{name}</code> — {st} → {fm} → {done} ({pct(done, st)})")
+    lines += [
+        "",
+        "<i>Блокировку бот узнаёт только при попытке написать пользователю "
+        "(например, во время рассылки), поэтому число может быть занижено.</i>",
+    ]
+    await message.answer("\n".join(lines))
 
 
-@dp.message(Command("export"))
+@private.message(Command("export"))
 async def on_export(message: Message) -> None:
     if message.from_user.id not in ADMIN_USER_IDS:
         return
@@ -537,14 +1080,14 @@ async def on_export(message: Message) -> None:
         await message.answer("Заявок пока нет.")
         return
     buf = build_export_xlsx()
-    filename = f"leads_{datetime.now():%Y-%m-%d_%H%M}.xlsx"
+    filename = f"leads_{datetime.now(LOCAL_TZ):%Y-%m-%d_%H%M}.xlsx"
     await message.answer_document(
         BufferedInputFile(buf.read(), filename=filename),
         caption=f"📊 Заявки: {count} шт.",
     )
 
 
-@dp.message(Command("broadcast"))
+@private.message(Command("broadcast"))
 async def on_broadcast_cmd(message: Message, state: FSMContext) -> None:
     if message.from_user.id not in ADMIN_USER_IDS:
         return
@@ -561,7 +1104,7 @@ async def on_broadcast_cmd(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.message(StateFilter(Broadcast.waiting))
+@private.message(StateFilter(Broadcast.waiting))
 async def on_broadcast_content(message: Message, state: FSMContext) -> None:
     recipients = get_broadcast_recipients()
     if not recipients:
@@ -576,7 +1119,7 @@ async def on_broadcast_content(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.callback_query(StateFilter(Broadcast.confirm), F.data == "bc_cancel")
+@private.callback_query(StateFilter(Broadcast.confirm), F.data == "bc_cancel")
 async def on_broadcast_cancel(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await cb.answer()
@@ -585,7 +1128,7 @@ async def on_broadcast_cancel(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.message.answer("🚫 Рассылка отменена.")
 
 
-@dp.callback_query(StateFilter(Broadcast.confirm), F.data == "bc_send")
+@private.callback_query(StateFilter(Broadcast.confirm), F.data == "bc_send")
 async def on_broadcast_send(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     await state.clear()
@@ -634,7 +1177,7 @@ async def on_broadcast_send(cb: CallbackQuery, state: FSMContext, bot: Bot) -> N
     )
 
 
-@dp.callback_query(F.data == "apply")
+@private.callback_query(F.data == "apply")
 async def on_apply(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await cb.answer()
     touch_funnel(cb.from_user, "started_form_at")
@@ -643,7 +1186,7 @@ async def on_apply(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await start_form(bot, cb.message.chat.id, state, cb.from_user)
 
 
-@dp.callback_query(F.data == "cancel")
+@private.callback_query(F.data == "cancel")
 async def on_cancel(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
     await state.clear()
@@ -651,7 +1194,7 @@ async def on_cancel(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.message.edit_text("🚫 Заявка отменена.", reply_markup=apply_keyboard())
 
 
-@dp.callback_query(StateFilter(Form.confirm), F.data == "send")
+@private.callback_query(StateFilter(Form.confirm), F.data == "send")
 async def on_send(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await guard(cb, state)
     if data is None:
@@ -659,11 +1202,7 @@ async def on_send(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     app_id = save_application(cb.from_user, data)
     touch_funnel(cb.from_user, "completed_at")
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, admin_text(app_id, cb.from_user, data))
-        except Exception:
-            logging.exception("Не удалось отправить заявку в чат %s", admin_id)
+    await send_lead_cards(bot, app_id)
     name = f", {escape(data['name'])}" if data.get("name") else ""
     await cb.answer("Заявка отправлена!")
     await cb.message.edit_text(
@@ -672,7 +1211,7 @@ async def on_send(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     )
 
 
-@dp.callback_query(StateFilter(Form.confirm), F.data == "restart")
+@private.callback_query(StateFilter(Form.confirm), F.data == "restart")
 async def on_restart(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if await guard(cb, state) is None:
         return
@@ -683,7 +1222,7 @@ async def on_restart(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
 STEP_FILTER = StateFilter(*STEP_STATES.values(), Form.confirm)
 
 
-@dp.callback_query(STEP_FILTER, F.data == "back")
+@private.callback_query(STEP_FILTER, F.data == "back")
 async def on_back(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await guard(cb, state)
     if data is None:
@@ -692,16 +1231,19 @@ async def on_back(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await go_back(bot, cb.message.chat.id, state, cb.from_user, data["step"])
 
 
-@dp.callback_query(StateFilter(*STEP_STATES.values()), F.data == "skip")
+@private.callback_query(StateFilter(*STEP_STATES.values()), F.data == "skip")
 async def on_skip(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await guard(cb, state)
     if data is None:
+        return
+    if data["step"] in REQUIRED_STEPS:
+        await cb.answer("Этот вопрос обязательный", show_alert=True)
         return
     await cb.answer()
     await save_and_next(bot, cb.message.chat.id, state, cb.from_user, data["step"], None)
 
 
-@dp.callback_query(StateFilter(*STEP_STATES.values()), F.data.startswith("use:"))
+@private.callback_query(StateFilter(*STEP_STATES.values()), F.data.startswith("use:"))
 async def on_use(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await guard(cb, state)
     if data is None:
@@ -719,13 +1261,28 @@ async def on_use(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await save_and_next(bot, cb.message.chat.id, state, cb.from_user, data["step"], value)
 
 
-@dp.message(StateFilter(Form.phone), F.contact)
+@private.callback_query(StateFilter(*STEP_STATES.values()), F.data.startswith("pick:"))
+async def on_pick(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    data = await guard(cb, state)
+    if data is None:
+        return
+    options = CHOICES.get(data["step"])
+    try:
+        value = options[int(cb.data.split(":", 1)[1])]
+    except (TypeError, ValueError, IndexError):
+        await cb.answer("Эта кнопка уже неактуальна")
+        return
+    await cb.answer()
+    await save_and_next(bot, cb.message.chat.id, state, cb.from_user, data["step"], value)
+
+
+@private.message(StateFilter(Form.phone), F.contact)
 async def on_contact(message: Message, state: FSMContext, bot: Bot) -> None:
     phone = norm_phone(message.contact.phone_number) or message.contact.phone_number
     await save_and_next(bot, message.chat.id, state, message.from_user, "phone", phone)
 
 
-@dp.message(StateFilter(*STEP_STATES.values()), F.text, ~F.text.startswith("/"))
+@private.message(StateFilter(*STEP_STATES.values()), F.text, ~F.text.startswith("/"))
 async def on_step_text(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     step = data["step"]
@@ -743,22 +1300,22 @@ async def on_step_text(message: Message, state: FSMContext, bot: Bot) -> None:
     await save_and_next(bot, message.chat.id, state, message.from_user, step, value)
 
 
-@dp.callback_query()
+@private.callback_query()
 async def on_stale_callback(cb: CallbackQuery) -> None:
     await cb.answer("Эта кнопка уже неактуальна. Нажмите /start")
 
 
-@dp.message(STEP_FILTER)
+@private.message(STEP_FILTER)
 async def on_step_other(message: Message) -> None:
     await message.answer("Пожалуйста, ответьте текстом или воспользуйтесь кнопками под вопросом.")
 
 
-@dp.message(StateFilter(Broadcast.confirm))
+@private.message(StateFilter(Broadcast.confirm))
 async def on_broadcast_confirm_other(message: Message) -> None:
     await message.answer("Воспользуйтесь кнопками под сообщением выше — «Разослать» или «Отмена».")
 
 
-@dp.message()
+@private.message()
 async def on_anything(message: Message) -> None:
     await message.answer(
         "Чтобы оставить заявку, нажмите кнопку ниже 👇", reply_markup=apply_keyboard()
@@ -790,7 +1347,12 @@ async def main() -> None:
     init_db()
     bot = Bot(BOT_TOKEN, default=bot_props)
     await setup_commands(bot)
-    await dp.start_polling(bot)
+    reminders = asyncio.create_task(reminder_loop(bot)) if REMIND_AFTER_MIN > 0 else None
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if reminders:
+            reminders.cancel()
 
 
 if __name__ == "__main__":
