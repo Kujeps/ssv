@@ -24,7 +24,8 @@ from aiogram.types import (
 )
 
 from config import (
-    ADMIN_USER_IDS, CALLBACK_OPTIONS, LOCAL_TZ, NOCALL_ALERT_ATTEMPTS,
+    ADMIN_USER_IDS, CALLBACK_OPTIONS, LOCAL_TZ, NOCALL_ALERT_ATTEMPTS, REMINDER_DELAYS_HOURS,
+    REMINDER_WINDOW_MSK,
     PER_PAGE, REASON_REQUIRED, STATUSES,
 )
 from db import (
@@ -32,11 +33,13 @@ from db import (
     build_export_xlsx, create_source, finish_lead, get_application, get_broadcast_recipients,
     get_history, get_stats, list_moderators, list_sources, mark_blocked,
     moderator_stats, parked_leads, postpone_lead, release_lead, remove_moderator,
-    save_lead_message, source_label, source_name_taken, source_names, take_callback, take_lead,
-    used_sources,
+    save_lead_message, set_setting, source_label, source_name_taken, source_names, take_callback,
+    take_lead, used_sources, build_users_xlsx, reminder_stats, reminders_enabled, users_counts,
+    users_page,
 )
 from form import STEP_STATES, Form
 from notify import notify_admins, notify_moderators_queue, refresh_cards
+from reminders import pending_counts, staff_ids
 from roles import IsAdmin, IsModerator, IsStaff, is_admin
 from ui import (
     admin_panel, broadcast_confirm_keyboard, btn, lead_keyboard, lead_text, mod_panel,
@@ -387,6 +390,16 @@ def build_stats_text() -> str:
     if mods:
         lines += ["", "👷 <b>Модераторы</b>"]
         lines += [moderator_line(e) for e in mods]
+    rem = reminder_stats()
+    lines += ["", f"🔔 <b>Напоминания</b> — {'включены' if rem['enabled'] else 'выключены'}"]
+    if rem["total"] or rem["enabled"]:
+        stages = " · ".join(f"{i + 1}-е: {rem['by_stage'].get(i, 0)}" for i in range(len(REMINDER_DELAYS_HOURS)))
+        lines += [
+            f"Отправлено: <b>{rem['total']}</b> ({stages})",
+            f"Получили хотя бы одно: <b>{rem['reminded']}</b> · после этого подали заявку: "
+            f"<b>{rem['converted']}</b> ({pct(rem['converted'], rem['reminded'])})",
+            f"Отписались: <b>{rem['optout']}</b>",
+        ]
     if s["sources"]:
         lines += ["", "🔖 <b>Источники</b> <i>(запустили → начали → подали)</i>"]
         names = source_names()
@@ -863,6 +876,136 @@ async def on_archive_open_card(cb: CallbackQuery, state: FSMContext) -> None:
 @staff.callback_query(F.data == "noop", IsStaff())
 async def on_noop(cb: CallbackQuery) -> None:
     await cb.answer()
+
+
+# ---------- админ: напоминания ----------
+
+def schedule_text() -> str:
+    total, hours = 0, []
+    for d in REMINDER_DELAYS_HOURS:
+        total += d
+        hours.append(str(total))
+    return ", ".join(hours[:-1]) + f" и {hours[-1]} ч после запуска бота"
+
+
+@staff.callback_query(F.data == "ap:rem", IsAdmin())
+async def on_reminders_toggle(cb: CallbackQuery, bot: Bot) -> None:
+    if reminders_enabled():
+        set_setting("reminders", "0")
+        await cb.answer("🔔 Напоминания выключены")
+        await send_panel(bot, cb.message.chat.id, cb.from_user.id)
+        return
+    await cb.answer()
+    people, due = pending_counts()
+    start, end = REMINDER_WINDOW_MSK
+    await cb.message.answer(
+        "🔔 <b>Включить напоминания?</b>\n\n"
+        "Бот напишет тем, кто запустил его, но не оставил заявку: "
+        f"через {schedule_text()}. Отправка — только с {start}:00 до {end}:00 по Москве.\n\n"
+        f"Сейчас серия положена <b>{people}</b> чел., из них <b>{due}</b> получат первое сообщение "
+        "в ближайшие тихие часы. Каждое сообщение содержит кнопку «Не напоминать».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("✅ Включить", "ap:remon")], [btn("↩️ Отмена", "mp:menu")],
+        ]),
+    )
+
+
+@staff.callback_query(F.data == "ap:remon", IsAdmin())
+async def on_reminders_on(cb: CallbackQuery, bot: Bot) -> None:
+    set_setting("reminders", "1")
+    await cb.answer("🔔 Напоминания включены")
+    with suppress(TelegramBadRequest):
+        await cb.message.edit_reply_markup(reply_markup=None)
+    await send_panel(bot, cb.message.chat.id, cb.from_user.id)
+
+
+# ---------- админ: пользователи бота и журнал запусков ----------
+
+USER_FILTER_TITLES = [
+    ("all", "Все"), ("not_applied", "Не подали"), ("abandoned", "Бросили анкету"),
+    ("applied", "Подали заявку"), ("optout", "Отписались"), ("blocked", "Заблокировали"),
+]
+
+
+def users_view(kind: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    staff = staff_ids()
+    counts = users_counts(staff)
+    total, page, rows = users_page(kind, page, staff)
+    pages = max(1, -(-total // 8))
+    title = dict(USER_FILTER_TITLES)[kind]
+    lines = [
+        "👤 <b>Пользователи бота</b>",
+        "",
+        f"Запустили: <b>{counts['all']}</b> · не подали: <b>{counts['not_applied']}</b> "
+        f"(бросили анкету: {counts['abandoned']}) · подали: <b>{counts['applied']}</b>",
+        f"Отписались от напоминаний: {counts['optout']} · заблокировали бота: {counts['blocked']}",
+        "",
+        f"<b>{title}</b>: {total}" + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""),
+        "",
+    ]
+    names = source_names()
+    for r in rows:
+        icon = "✅" if r["completed_at"] else ("✍️" if r["started_form_at"] else "👋")
+        who = escape(r["full_name"] or "—") + (f" (@{escape(r['username'])})" if r["username"] else "")
+        extra = []
+        if r["source"]:
+            extra.append(escape(names.get(r["source"], r["source"])))
+        if r["rem_count"]:
+            extra.append(f"🔔{r['rem_count']}")
+        if r["rem_off"]:
+            extra.append("🔕")
+        if r["blocked_at"]:
+            extra.append("🚫")
+        when = fmt_ts(r["last_start_at"] or r["started_at"])
+        lines.append(f"{icon} {when} · {who}" + (" · " + " ".join(extra) if extra else ""))
+    if not rows:
+        lines.append("Пока никого нет.")
+    keyboard = []
+    buttons = [btn(("• " if k == kind else "") + t, f"us:{k}:0") for k, t in USER_FILTER_TITLES]
+    keyboard += [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("⬅️", f"us:{kind}:{page - 1}"))
+        nav.append(btn(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(btn("➡️", f"us:{kind}:{page + 1}"))
+        keyboard.append(nav)
+    keyboard.append([btn("📤 Excel по фильтру", f"us:x:{kind}")])
+    keyboard.append([btn("🏠 Меню", "mp:menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+@staff.callback_query(F.data == "ap:users", IsAdmin())
+async def on_users_open(cb: CallbackQuery) -> None:
+    await cb.answer()
+    text, markup = users_view("all", 0)
+    await cb.message.answer(text, reply_markup=markup)
+
+
+@staff.callback_query(F.data.regexp(r"^us:(all|not_applied|abandoned|applied|optout|blocked):\d+$"), IsAdmin())
+async def on_users_page(cb: CallbackQuery) -> None:
+    _, kind, page = cb.data.split(":")
+    await cb.answer()
+    text, markup = users_view(kind, int(page))
+    with suppress(TelegramBadRequest):
+        await cb.message.edit_text(text, reply_markup=markup)
+
+
+@staff.callback_query(F.data.startswith("us:x:"), IsAdmin())
+async def on_users_export(cb: CallbackQuery, bot: Bot) -> None:
+    from datetime import datetime
+    kind = cb.data.rsplit(":", 1)[1]
+    if kind not in dict(USER_FILTER_TITLES):
+        await cb.answer()
+        return
+    await cb.answer()
+    buf = build_users_xlsx(kind, staff_ids())
+    filename = f"users_{datetime.now(LOCAL_TZ):%Y-%m-%d_%H%M}.xlsx"
+    await bot.send_document(
+        cb.message.chat.id, BufferedInputFile(buf.read(), filename=filename),
+        caption=f"👤 Пользователи бота — {dict(USER_FILTER_TITLES)[kind]}",
+    )
 
 
 # ---------- рекламные ссылки и рассылка (админ) ----------

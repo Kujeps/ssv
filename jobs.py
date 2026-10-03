@@ -14,6 +14,7 @@ from db import (
     mark_cb_notified, mark_reminded, mark_warned, overdue_callbacks, system_requeue,
 )
 from notify import notify_admins, notify_moderators_queue, refresh_cards
+from reminders import run_reminders
 from ui import btn
 from utils import fmt_hhmm, fmt_wait, utc_now
 
@@ -98,6 +99,9 @@ async def run_maintenance(bot: Bot, now: datetime | None = None) -> None:
 
     if returned:
         await notify_moderators_queue(bot, "↩️ Заявка вернулась в очередь")
+
+    # 6. Напоминания тем, кто запустил бота, но не оставил заявку (если включены админом).
+    await run_reminders(bot, now)
 
 
 async def maintenance_loop(bot: Bot) -> None:

@@ -110,7 +110,17 @@ def init_db() -> None:
             "warned": "INTEGER DEFAULT 0",
             "cb_notified": "INTEGER DEFAULT 0",
         })
-        ensure_columns(db, "funnel", {"blocked_at": "TEXT", "source": "TEXT"})
+        ensure_columns(db, "funnel", {
+            "blocked_at": "TEXT",
+            "source": "TEXT",
+            "last_start_at": "TEXT",              # последний /start
+            "starts": "INTEGER DEFAULT 0",        # сколько раз нажимал /start
+            # Напоминания о незавершённой заявке.
+            "rem_count": "INTEGER DEFAULT 0",
+            "rem_last_at": "TEXT",
+            "rem_first_at": "TEXT",
+            "rem_off": "INTEGER DEFAULT 0",       # нажал «Не напоминать»
+        })
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS lead_messages (
@@ -155,6 +165,31 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 created_by INTEGER
+            )
+            """
+        )
+        db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS start_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                username TEXT,
+                full_name TEXT,
+                source TEXT,
+                is_new INTEGER
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminder_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sent_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                stage INTEGER,
+                kind TEXT
             )
             """
         )
@@ -947,3 +982,188 @@ def build_export_xlsx(filters: dict | None = None, scope_mod: int | None = None)
     wb.save(buf)
     buf.seek(0)
     return buf
+
+
+# ---------- настройки ----------
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with closing(connect()) as db:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with closing(connect()) as db, db:
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def reminders_enabled() -> bool:
+    """Напоминания по умолчанию выключены — админ включает их в панели."""
+    return get_setting("reminders") == "1"
+
+
+# ---------- журнал запусков и пользователи ----------
+
+def log_start(user, source: str | None, is_new: bool) -> None:
+    """Каждое нажатие /start попадает в журнал (админу в личку больше не пишется)."""
+    with closing(connect()) as db, db:
+        db.execute(
+            "INSERT INTO start_log (user_id, username, full_name, source, is_new) VALUES (?, ?, ?, ?, ?)",
+            (user.id, user.username, user.full_name, source, int(is_new)),
+        )
+        db.execute(
+            "UPDATE funnel SET last_start_at = CURRENT_TIMESTAMP, starts = COALESCE(starts, 0) + 1"
+            " WHERE user_id = ?",
+            (user.id,),
+        )
+
+
+USER_FILTERS = {
+    "all": "1",
+    "not_applied": "f.completed_at IS NULL",
+    "abandoned": "f.started_form_at IS NOT NULL AND f.completed_at IS NULL",
+    "applied": "f.completed_at IS NOT NULL",
+    "optout": "COALESCE(f.rem_off, 0) = 1",
+    "blocked": "f.blocked_at IS NOT NULL",
+}
+
+
+def _users_where(kind: str, staff_ids: list[int]) -> tuple[str, list]:
+    marks = ",".join("?" * len(staff_ids)) or "NULL"
+    where = (
+        f" WHERE f.started_at IS NOT NULL AND ({USER_FILTERS[kind]})"
+        f" AND f.user_id NOT IN ({marks})"
+        " AND f.user_id NOT IN (SELECT user_id FROM moderators)"
+    )
+    return where, list(staff_ids)
+
+
+def users_counts(staff_ids: list[int]) -> dict[str, int]:
+    with closing(connect()) as db:
+        result = {}
+        for kind in USER_FILTERS:
+            where, args = _users_where(kind, staff_ids)
+            result[kind] = db.execute(f"SELECT COUNT(*) FROM funnel f{where}", args).fetchone()[0]
+    return result
+
+
+def users_page(kind: str, page: int, staff_ids: list[int], per_page: int = 8) -> tuple[int, int, list[dict]]:
+    """Пользователи бота, недавно запускавшие — сверху: (всего, страница, строки)."""
+    where, args = _users_where(kind, staff_ids)
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        total = db.execute(f"SELECT COUNT(*) FROM funnel f{where}", args).fetchone()[0]
+        pages = max(1, -(-total // per_page))
+        page = min(max(page, 0), pages - 1)
+        rows = db.execute(
+            "SELECT f.user_id, f.username, f.full_name, f.source, f.started_at, f.last_start_at,"
+            " f.starts, f.started_form_at, f.completed_at, f.rem_count, f.rem_off, f.blocked_at"
+            f" FROM funnel f{where} ORDER BY COALESCE(f.last_start_at, f.started_at) DESC, f.user_id DESC"
+            " LIMIT ? OFFSET ?",
+            (*args, per_page, page * per_page),
+        ).fetchall()
+    return total, page, [dict(r) for r in rows]
+
+
+def build_users_xlsx(kind: str, staff_ids: list[int]) -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Пользователи"
+    headers = [
+        ("User ID", 12), ("Имя", 20), ("Username", 16), ("Источник", 16), ("Первый запуск", 17),
+        ("Последний запуск", 17), ("Запусков", 10), ("Начал анкету", 14), ("Подал заявку", 14),
+        ("Напоминаний", 12), ("Отписался от напоминаний", 22), ("Заблокировал бота", 18),
+    ]
+    ws.append([h for h, _ in headers])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    names = source_names()
+    where, args = _users_where(kind, staff_ids)
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            f"SELECT * FROM funnel f{where} ORDER BY COALESCE(f.last_start_at, f.started_at) DESC", args
+        ).fetchall()
+    yes = lambda v: "да" if v else ""
+    for r in rows:
+        ws.append([safe_cell(v) for v in [
+            r["user_id"], r["full_name"], f"@{r['username']}" if r["username"] else "",
+            names.get(r["source"], r["source"]), fmt_ts(r["started_at"], "%d.%m.%Y %H:%M"),
+            fmt_ts(r["last_start_at"] or r["started_at"], "%d.%m.%Y %H:%M"), r["starts"] or 1,
+            yes(r["started_form_at"]), yes(r["completed_at"]), r["rem_count"] or 0,
+            yes(r["rem_off"]), yes(r["blocked_at"]),
+        ]])
+    for i, (_, width) in enumerate(headers, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ---------- напоминания ----------
+
+def reminder_candidates(staff_ids: list[int]) -> list[dict]:
+    """Все, кому положено очередное напоминание: запустили бота, не подали заявку,
+    не заблокировали и не отписались. due_at — когда пора слать (UTC), group — start/form."""
+    delays = config.REMINDER_DELAYS_HOURS
+    marks = ",".join("?" * len(staff_ids)) or "NULL"
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT user_id, started_at, started_form_at, rem_count, rem_last_at FROM funnel"
+            " WHERE started_at IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL"
+            " AND COALESCE(rem_off, 0) = 0 AND COALESCE(rem_count, 0) < ?"
+            f" AND user_id NOT IN ({marks})"
+            " AND user_id NOT IN (SELECT user_id FROM moderators)",
+            (len(delays), *staff_ids),
+        ).fetchall()
+    result = []
+    for r in rows:
+        stage = r["rem_count"] or 0
+        base = parse_utc(r["started_at"] if stage == 0 else r["rem_last_at"] or r["started_at"])
+        if base is None:
+            continue
+        result.append({
+            "user_id": r["user_id"], "stage": stage,
+            "group": "form" if r["started_form_at"] else "start",
+            "due_at": base + timedelta(hours=delays[stage]),
+        })
+    return sorted(result, key=lambda c: c["due_at"])
+
+
+def mark_reminder_sent(user_id: int, stage: int, group: str) -> None:
+    with closing(connect()) as db, db:
+        db.execute(
+            "UPDATE funnel SET rem_count = COALESCE(rem_count, 0) + 1, rem_last_at = CURRENT_TIMESTAMP,"
+            " rem_first_at = COALESCE(rem_first_at, CURRENT_TIMESTAMP) WHERE user_id = ?",
+            (user_id,),
+        )
+        db.execute(
+            "INSERT INTO reminder_log (user_id, stage, kind) VALUES (?, ?, ?)", (user_id, stage, group)
+        )
+
+
+def set_reminders_off(user_id: int) -> None:
+    with closing(connect()) as db, db:
+        db.execute("UPDATE funnel SET rem_off = 1 WHERE user_id = ?", (user_id,))
+
+
+def reminder_stats() -> dict:
+    with closing(connect()) as db:
+        by_stage = dict(db.execute("SELECT stage, COUNT(*) FROM reminder_log GROUP BY stage").fetchall())
+        reminded, converted, optout = db.execute(
+            "SELECT COUNT(*) FILTER (WHERE rem_first_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE rem_first_at IS NOT NULL AND completed_at >= rem_first_at),"
+            " COUNT(*) FILTER (WHERE rem_off = 1) FROM funnel"
+        ).fetchone()
+    return {
+        "enabled": reminders_enabled(), "by_stage": by_stage, "total": sum(by_stage.values()),
+        "reminded": reminded, "converted": converted, "optout": optout,
+    }

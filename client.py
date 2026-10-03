@@ -1,5 +1,4 @@
 """Клиентская часть: приветствие, пошаговая анкета, защита от повторных заявок."""
-import logging
 from contextlib import suppress
 from html import escape
 
@@ -10,15 +9,17 @@ from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove, User
 
-from config import ADMIN_USER_IDS, CHOICES, GENDERS, REQUIRED_STEPS
+from config import CHOICES, GENDERS, REQUIRED_STEPS
 from db import (
-    active_application, had_started_before, save_application, source_label, touch_funnel,
+    active_application, had_started_before, log_start, save_application, set_reminders_off,
+    touch_funnel,
 )
 from form import (
     BTN_BACK, BTN_SKIP, CONTACT_KEYS, GREETING, LAST_CONTACT_STEP, NORMALIZERS, PROMPTS,
     ERRORS, STEP_STATES, Form, active_steps, card, header, norm_phone, parse_source,
 )
 from notify import notify_moderators_queue, send_lead_cards
+from reminders import OPTOUT_DONE
 from ui import (
     apply_keyboard, confirm_keyboard, pending_notice, phone_keyboard, step_keyboard,
 )
@@ -109,27 +110,6 @@ async def guard(cb: CallbackQuery, state: FSMContext) -> dict | None:
 
 # ---------- обработчики ----------
 
-async def notify_start(
-    bot: Bot, user: User, is_new: bool, source: str | None, pending: dict | None = None
-) -> None:
-    label = "🆕 Новый пользователь запустил бота" if is_new else "🔁 Пользователь снова нажал /start"
-    username = f"@{user.username}" if user.username else "нет username"
-    text = (
-        f"▶️ <b>{label}</b>\n\n"
-        f"👤 <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a> · {escape(username)}\n"
-        f"ID: <code>{user.id}</code>"
-    )
-    if source:
-        text += f"\n🔖 Источник: <b>{escape(source_label(source))}</b>"
-    if pending:
-        text += f"\n⏳ Заявка #{pending['id']} уже ждёт обработки"
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception:
-            logging.exception("Не удалось отправить уведомление о /start админу %s", admin_id)
-
-
 @client.message(CommandStart())
 async def on_start(
     message: Message, state: FSMContext, bot: Bot, command: CommandObject
@@ -137,8 +117,8 @@ async def on_start(
     source = parse_source(command.args)
     is_new = not had_started_before(message.from_user.id)
     touch_funnel(message.from_user, "started_at", source)
+    log_start(message.from_user, source, is_new)  # в журнал, а не админу в личку
     pending = active_application(message.from_user.id)
-    await notify_start(bot, message.from_user, is_new, source, pending)
     await clear_prev(bot, message.chat.id, await state.get_data())
     await state.clear()
     if pending:
@@ -289,6 +269,14 @@ async def on_step_text(message: Message, state: FSMContext, bot: Bot) -> None:
         await message.answer(ERRORS[step])
         return
     await save_and_next(bot, message.chat.id, state, message.from_user, step, value)
+
+
+@client.callback_query(F.data == "rem:off")
+async def on_reminders_off(cb: CallbackQuery) -> None:
+    set_reminders_off(cb.from_user.id)
+    await cb.answer("Хорошо, больше не напомним")
+    with suppress(TelegramBadRequest):
+        await cb.message.edit_text(OPTOUT_DONE, reply_markup=None)
 
 
 @client.callback_query()

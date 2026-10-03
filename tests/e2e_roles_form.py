@@ -13,7 +13,10 @@ async def main():
     # --- роли ---
     await w.msg(21, "/start")
     assert "оставьте заявку" in w.last_to(21)["text"] and "Оставить заявку" in str(w.buttons(w.last_to(21)["kb"])); ok("клиент: приветствие и кнопка «Оставить заявку»")
-    assert any("Новый пользователь" in s["text"] for s in w.to(1)); ok("админу приходит уведомление о /start клиента")
+    assert not w.to(1), w.to(1); ok("админу в личку о /start клиента НИЧЕГО не приходит")
+    import sqlite3 as _s
+    log = _s.connect(path).execute("SELECT user_id, is_new FROM start_log").fetchall()
+    assert log == [(21, 1)]; ok("запуск записан в журнал (start_log)")
     w.clear()
     await w.msg(1, "/start")
     t = w.last_to(1)
