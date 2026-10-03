@@ -15,7 +15,7 @@ async def main():
     async def lead(uid, name):
         i = D.save_application(User(id=uid, is_bot=False, first_name=name, username=f"u{uid}"), {"name": name, "phone": f"+7999{uid}", "tz": "Москва (МСК)", "call_time": "В любое время"})
         await N.send_lead_cards(w.bot, i); return i
-    assert C.HOLD_MINUTES == 60 and C.REMIND_AFTER_MIN == 120 and C.CALLBACK_RETURN_HOURS == 24; ok("настройки по умолчанию: 1 час на заявку, напоминание 2 часа, возврат перезвона 24 часа")
+    assert C.HOLD_MINUTES == 60 and C.CALLBACK_RETURN_HOURS == 24; ok("настройки по умолчанию: 1 час на заявку, возврат перезвона 24 часа")
     a = await lead(101, "Клиент1"); b = await lead(102, "Клиент2"); c3 = await lead(103, "Клиент3")
 
     # --- предупреждение и автовозврат ---
@@ -52,17 +52,9 @@ async def main():
     assert any("Перезвон" in (s["text"] or "") and "просрочен" in s["text"] for s in w.to(50)) and any("не перезвонил" in (s["text"] or "") for s in w.to(1)); ok("и модератор, и админ уведомлены")
     assert [h["kind"] for h in D.get_history(cur)][-1] == "cb_timeout"
 
-    # --- напоминания админу о долгом ожидании в очереди ---
-    sql("UPDATE applications SET status='agreed' WHERE id IN (?, ?)", a, b)   # остальные закрыты
-    sql("UPDATE applications SET status='agreed' WHERE id=?", cur)
-    q = c3
-    for k in range(1, 5):
-        sql("UPDATE applications SET queued_at = datetime('now','-3 hours'), reminded_at = datetime('now','-3 hours') WHERE id=?", q)
-        w.clear(); await J.run_maintenance(w.bot)
-        r = [s for s in w.to(1) if "ждёт в очереди" in (s["text"] or "")]
-        assert (len(r) == 1 and f"#{q}" in r[0]["text"] and "3 ч" in r[0]["text"]) if k <= 3 else not r, (k, r)
-    ok("заявка в очереди дольше 2 часов: админу 3 напоминания, не больше")
-    sql("UPDATE applications SET queued_at = datetime('now','-90 minutes'), remind_count = 0, reminded_at = NULL WHERE id=?", q)
-    w.clear(); await J.run_maintenance(w.bot); assert not [s for s in w.to(1) if "ждёт в очереди" in (s["text"] or "")]; ok("через 90 минут напоминаний ещё нет")
+    # --- заявка, долго лежащая в очереди, админу НЕ напоминается (спама нет) ---
+    sql("UPDATE applications SET queued_at = datetime('now','-10 hours') WHERE id=?", c3)
+    w.clear(); await J.run_maintenance(w.bot)
+    assert not [s for s in w.to(1) if "ждёт в очереди" in (s["text"] or "")]; ok("заявка 10 часов в очереди: админу напоминаний о ней нет")
     print("\nN3: таймеры — ВСЁ ПРОШЛО")
 run(main())

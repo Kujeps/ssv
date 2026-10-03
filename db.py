@@ -13,7 +13,7 @@ from openpyxl.styles import Font
 import config
 from config import (
     BLOCKING_STATUSES, FINAL_STATUSES, HOLD_MINUTES, HOLD_WARN_MINUTES,
-    MSK, PER_PAGE, REMIND_MAX, SOURCE_CODE_LEN, STATUSES, TZ_BY_LABEL,
+    MSK, PER_PAGE, SOURCE_CODE_LEN, STATUSES, TZ_BY_LABEL,
 )
 from utils import (
     call_time_display, client_local, fmt_ts, lead_priority, norm_phone, parse_utc, safe_cell,
@@ -726,29 +726,6 @@ def system_requeue(app_id: int, kind: str, holder_id: int | None) -> bool:
             return False
         _requeue(db, app_id, 0, "Система", kind, holder_id)
     return True
-
-
-def due_queue_reminders(now: datetime | None = None) -> list[tuple[int, int]]:
-    """Заявки, которые слишком долго ждут в очереди: (id, минут ожидания)."""
-    limit = utc_str((now or utc_now()) - timedelta(minutes=config.REMIND_AFTER_MIN))
-    with closing(connect()) as db:
-        rows = db.execute(
-            "SELECT id, COALESCE(queued_at, created_at) FROM applications"
-            " WHERE COALESCE(status, 'new') = 'new' AND COALESCE(remind_count, 0) < ?"
-            " AND COALESCE(reminded_at, queued_at, created_at) <= ?",
-            (REMIND_MAX, limit),
-        ).fetchall()
-    n = now or utc_now()
-    return [(i, int((n - parse_utc(q)).total_seconds() // 60)) for i, q in rows]
-
-
-def mark_reminded(app_ids: set[int]) -> None:
-    with closing(connect()) as db, db:
-        db.executemany(
-            "UPDATE applications SET remind_count = COALESCE(remind_count, 0) + 1,"
-            " reminded_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [(i,) for i in app_ids],
-        )
 
 
 # ---------- архив: фильтры и поиск ----------

@@ -31,9 +31,6 @@ HOLD_MINUTES = env_int("HOLD_MINUTES", 60)
 HOLD_WARN_MINUTES = 10
 # Через сколько часов после назначенного времени перезвона заявка вернётся в очередь.
 CALLBACK_RETURN_HOURS = env_int("CALLBACK_RETURN_HOURS", 24)
-# Напоминать админу о заявке, ждущей в очереди, через N минут (0 — выключить), не более REMIND_MAX раз.
-REMIND_AFTER_MIN = env_int("REMIND_AFTER_MIN", 120)
-REMIND_MAX = 3
 # После скольких недозвонов сообщить админу.
 NOCALL_ALERT_ATTEMPTS = 3
 

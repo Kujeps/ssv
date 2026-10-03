@@ -1,4 +1,4 @@
-"""Фоновые проверки: время на обработку заявки, перезвоны, напоминания о долгой очереди."""
+"""Фоновые проверки: время на обработку заявки, перезвоны, напоминания клиентам."""
 import asyncio
 import logging
 from datetime import datetime
@@ -7,16 +7,15 @@ from html import escape
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup
 
-import config
 from config import HOLD_MINUTES
 from db import (
-    queue_count, due_callbacks, due_queue_reminders, expired_holds, get_application, hold_warnings,
-    mark_cb_notified, mark_reminded, mark_warned, overdue_callbacks, system_requeue,
+    due_callbacks, expired_holds, get_application, hold_warnings, mark_cb_notified, mark_warned,
+    overdue_callbacks, system_requeue,
 )
 from notify import notify_admins, notify_moderators_queue, refresh_cards
 from reminders import run_reminders
 from ui import btn
-from utils import fmt_hhmm, fmt_wait, utc_now
+from utils import fmt_hhmm, utc_now
 
 CHECK_EVERY_SECONDS = 30
 
@@ -84,23 +83,10 @@ async def run_maintenance(bot: Bot, now: datetime | None = None) -> None:
             )
             await refresh_cards(bot, app_id)
 
-    # 5. Заявка слишком долго ждёт в очереди — напоминание админам.
-    if config.REMIND_AFTER_MIN > 0:
-        done = set()
-        for app_id, waited in due_queue_reminders(now):
-            await notify_admins(
-                bot,
-                f"⏰ <b>Заявка #{app_id}</b> ждёт в очереди уже {fmt_wait(waited)}. "
-                f"Всего в очереди: {queue_count()}.",
-            )
-            done.add(app_id)
-        if done:
-            mark_reminded(done)
-
     if returned:
         await notify_moderators_queue(bot, "↩️ Заявка вернулась в очередь")
 
-    # 6. Напоминания тем, кто запустил бота, но не оставил заявку (если включены админом).
+    # 5. Напоминания тем, кто запустил бота, но не оставил заявку (если включены админом).
     await run_reminders(bot, now)
 
 
