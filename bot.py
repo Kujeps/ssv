@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import sqlite3
+import string
 from contextlib import closing, suppress
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -54,13 +56,14 @@ DB_PATH = os.getenv("DB_PATH", "leads.db")
 # Часовой пояс для времени в карточках и Excel (смещение от UTC, по умолчанию Москва).
 LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "3"))))
 # Напоминать о необработанной заявке через N минут (0 — выключить), не более REMIND_MAX раз.
-REMIND_AFTER_MIN = int(os.getenv("REMIND_AFTER_MIN", "30"))
+REMIND_AFTER_MIN = int(os.getenv("REMIND_AFTER_MIN", "120"))
 REMIND_MAX = 3
 
 
 # ---------- настройки анкеты (при необходимости правятся здесь) ----------
 
 MIN_AGE, MAX_AGE = 18, 65
+SOURCE_CODE_LEN = 24  # длина случайного кода в рекламной ссылке
 
 UNITS = [
     "Сухопутные войска",
@@ -120,6 +123,10 @@ class Form(StatesGroup):
     call_time = State()
     comment = State()
     confirm = State()
+
+
+class SourceForm(StatesGroup):
+    name = State()
 
 
 class Broadcast(StatesGroup):
@@ -322,6 +329,17 @@ def init_db() -> None:
             """
         )
         db.execute("CREATE INDEX IF NOT EXISTS idx_lead_messages_app ON lead_messages (app_id)")
+        # Рекламные ссылки: случайный код в ссылке -> понятное название для админа.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sources (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                created_by INTEGER
+            )
+            """
+        )
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS lead_notes (
@@ -420,6 +438,49 @@ def mark_blocked(user_id: int) -> None:
         db.execute(
             "UPDATE funnel SET blocked_at = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,)
         )
+
+
+def source_names() -> dict[str, str]:
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        return dict(db.execute("SELECT code, name FROM sources").fetchall())
+
+
+def source_label(code: str | None) -> str | None:
+    """Название источника по коду из ссылки (неизвестный код показываем как есть)."""
+    return source_names().get(code, code) if code else None
+
+
+def source_name_taken(name: str) -> bool:
+    return any(n.casefold() == name.casefold() for n in source_names().values())
+
+
+def create_source(name: str, user_id: int) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    with closing(sqlite3.connect(DB_PATH)) as db, db:
+        while True:
+            code = "".join(secrets.choice(alphabet) for _ in range(SOURCE_CODE_LEN))
+            if not db.execute("SELECT 1 FROM sources WHERE code = ?", (code,)).fetchone():
+                break
+        db.execute(
+            "INSERT INTO sources (code, name, created_by) VALUES (?, ?, ?)", (code, name, user_id)
+        )
+    return code
+
+
+def list_sources(limit: int = 20) -> tuple[int, list[tuple]]:
+    """Последние созданные ссылки с числами: запустили / начали заявку / подали."""
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        total = db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        rows = db.execute(
+            "SELECT s.code, s.name,"
+            " COUNT(f.user_id) FILTER (WHERE f.started_at IS NOT NULL),"
+            " COUNT(f.user_id) FILTER (WHERE f.started_form_at IS NOT NULL),"
+            " COUNT(f.user_id) FILTER (WHERE f.completed_at IS NOT NULL)"
+            " FROM sources s LEFT JOIN funnel f ON f.source = s.code"
+            " GROUP BY s.code ORDER BY s.rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return total, rows
 
 
 def save_application(user: User, data: dict) -> int:
@@ -563,6 +624,7 @@ def build_export_xlsx() -> BytesIO:
     with closing(sqlite3.connect(DB_PATH)) as db:
         db.row_factory = sqlite3.Row
         apps = db.execute("SELECT * FROM applications ORDER BY id").fetchall()
+        names = source_names()
         notes: dict[int, list[str]] = {}
         for n in db.execute(
             "SELECT app_id, by_name, text, created_at FROM lead_notes ORDER BY id"
@@ -575,7 +637,7 @@ def build_export_xlsx() -> BytesIO:
         ws.append([safe_cell(v) for v in [
             a["id"], fmt_ts(a["created_at"], "%d.%m.%Y %H:%M"), a["name"], a["phone"],
             a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["medical"], a["age"], a["city"],
-            a["unit"], a["served"], a["call_time"], a["comment"], a["source"],
+            a["unit"], a["served"], a["call_time"], a["comment"], names.get(a["source"], a["source"]),
             STATUSES.get(status, STATUSES["new"])[1],
             a["status_by"] if status != "new" else "",
             fmt_ts(a["status_at"], "%d.%m.%Y %H:%M") if status != "new" else "",
@@ -802,7 +864,7 @@ def lead_text(app: dict) -> str:
         f" · {escape(username)} · ID <code>{app['user_id']}</code>",
     ]
     if app["source"]:
-        lines.append(f"🔖 Источник: <code>{escape(app['source'])}</code>")
+        lines.append(f"🔖 Источник: <b>{escape(source_label(app['source']))}</b>")
     if status != "new":
         lines += [
             "",
@@ -976,13 +1038,17 @@ async def on_note(message: Message, bot: Bot) -> None:
         await message.react([ReactionTypeEmoji(emoji="👍")])
 
 
+def fmt_wait(minutes: int) -> str:
+    return f"{minutes // 60} ч {minutes % 60:02d} мин" if minutes >= 60 else f"{minutes} мин"
+
+
 async def send_reminders(bot: Bot) -> None:
     done: set[int] = set()
     for app_id, chat_id, message_id, waited in due_reminders():
         try:
             await bot.send_message(
                 chat_id,
-                f"⏰ <b>Заявка #{app_id}</b> без обработки уже {waited} мин. "
+                f"⏰ <b>Заявка #{app_id}</b> без обработки уже {fmt_wait(waited)}. "
                 "Нажмите «Беру в работу» под карточкой.",
                 reply_parameters=ReplyParameters(
                     message_id=message_id, allow_sending_without_reply=True
@@ -1015,7 +1081,7 @@ async def notify_start(bot: Bot, user: User, is_new: bool, source: str | None) -
         f"ID: <code>{user.id}</code>"
     )
     if source:
-        text += f"\n🔖 Источник: <code>{escape(source)}</code>"
+        text += f"\n🔖 Источник: <b>{escape(source_label(source))}</b>"
     for admin_id in ADMIN_USER_IDS:
         try:
             await bot.send_message(admin_id, text)
@@ -1042,6 +1108,10 @@ async def on_cancel_cmd(message: Message, state: FSMContext, bot: Bot) -> None:
     if current in (Broadcast.waiting.state, Broadcast.confirm.state):
         await state.clear()
         await message.answer("🚫 Рассылка отменена.")
+        return
+    if current == SourceForm.name.state:
+        await state.clear()
+        await message.answer("🚫 Создание ссылки отменено.")
         return
     await clear_prev(bot, message.chat.id, await state.get_data())
     await state.clear()
@@ -1084,9 +1154,10 @@ async def on_stats(message: Message) -> None:
     )
     if s["sources"]:
         lines += ["", "🔖 <b>Источники</b> <i>(запустили → начали → подали)</i>"]
+        names = source_names()
         for source, st, fm, done in s["sources"]:
-            name = escape(source) if source else "без метки"
-            lines.append(f"<code>{name}</code> — {st} → {fm} → {done} ({pct(done, st)})")
+            name = escape(names.get(source, source)) if source else "без метки"
+            lines.append(f"<b>{name}</b> — {st} → {fm} → {done} ({pct(done, st)})")
     lines += [
         "",
         "<i>Блокировку бот узнаёт только при попытке написать пользователю "
@@ -1110,6 +1181,93 @@ async def on_export(message: Message) -> None:
         BufferedInputFile(buf.read(), filename=filename),
         caption=f"📊 Заявки: {count} шт.",
     )
+
+
+async def links_view(bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
+    username = (await bot.me()).username
+    total, rows = list_sources()
+    lines = [
+        "🔗 <b>Ссылки для рекламы</b>",
+        "",
+        "Каждая ссылка помечает людей, пришедших по ней: в заявках, статистике и Excel "
+        "будет видно название источника. Нажмите на ссылку, чтобы скопировать.",
+    ]
+    if not rows:
+        lines += ["", "Пока нет ни одной ссылки — нажмите «Создать ссылку»."]
+    for code, name, started, form, done in rows:
+        lines += [
+            "",
+            f"<b>{escape(name)}</b> — {started} → {form} → {done}",
+            f"<code>https://t.me/{username}?start={code}</code>",
+        ]
+    if rows:
+        lines += ["", "<i>Числа: запустили → начали заявку → подали.</i>"]
+    if total > len(rows):
+        lines.append(f"<i>Показаны последние {len(rows)} из {total}.</i>")
+    markup = InlineKeyboardMarkup(inline_keyboard=[[btn("➕ Создать ссылку", "lk_new")]])
+    return "\n".join(lines), markup
+
+
+@private.message(Command("links"))
+async def on_links(message: Message, state: FSMContext, bot: Bot) -> None:
+    if message.from_user.id not in ADMIN_USER_IDS:
+        return
+    await clear_prev(bot, message.chat.id, await state.get_data())
+    await state.clear()
+    text, markup = await links_view(bot)
+    await message.answer(text, reply_markup=markup)
+
+
+@private.callback_query(F.data == "lk_list")
+async def on_links_list(cb: CallbackQuery, bot: Bot) -> None:
+    if cb.from_user.id not in ADMIN_USER_IDS:
+        await cb.answer()
+        return
+    await cb.answer()
+    text, markup = await links_view(bot)
+    await cb.message.answer(text, reply_markup=markup)
+
+
+@private.callback_query(F.data == "lk_new")
+async def on_link_new(cb: CallbackQuery, state: FSMContext) -> None:
+    if cb.from_user.id not in ADMIN_USER_IDS:
+        await cb.answer()
+        return
+    await cb.answer()
+    await state.set_state(SourceForm.name)
+    await cb.message.answer(
+        "✍️ <b>Название источника</b>\n\n"
+        "Напишите, как назвать эту ссылку, например: <code>залив 1</code>. "
+        "Название видите только вы.\n\n/cancel — отмена"
+    )
+
+
+@private.message(StateFilter(SourceForm.name), F.text, ~F.text.startswith("/"))
+async def on_link_name(message: Message, state: FSMContext, bot: Bot) -> None:
+    name = " ".join(message.text.split())
+    if not 1 <= len(name) <= 50:
+        await message.answer("Название должно быть от 1 до 50 символов. Попробуйте ещё раз.")
+        return
+    if source_name_taken(name):
+        await message.answer("Источник с таким названием уже есть — придумайте другое.")
+        return
+    code = create_source(name, message.from_user.id)
+    await state.clear()
+    username = (await bot.me()).username
+    await message.answer(
+        f"✅ Ссылка для источника <b>{escape(name)}</b> создана:\n\n"
+        f"<code>https://t.me/{username}?start={code}</code>\n\n"
+        "Вставьте её в рекламу — всех, кто придёт по ней, бот пометит этим названием.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("➕ Создать ещё", "lk_new")],
+            [btn("📋 Все ссылки", "lk_list")],
+        ]),
+    )
+
+
+@private.message(StateFilter(SourceForm.name))
+async def on_link_name_other(message: Message) -> None:
+    await message.answer("Отправьте название текстом, например: <code>залив 1</code>.")
 
 
 @private.message(Command("broadcast"))
@@ -1356,6 +1514,7 @@ async def setup_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Оставить заявку"),
         BotCommand(command="stats", description="Статистика"),
         BotCommand(command="export", description="Выгрузить заявки в Excel"),
+        BotCommand(command="links", description="Ссылки для рекламы"),
         BotCommand(command="broadcast", description="Рассылка пользователям"),
     ]
     for admin_id in ADMIN_USER_IDS:
