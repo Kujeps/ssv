@@ -63,6 +63,7 @@ REMIND_MAX = 3
 # ---------- настройки анкеты (при необходимости правятся здесь) ----------
 
 MIN_AGE, MAX_AGE = 18, 65
+PENDING_PER_PAGE = 5  # заявок на странице списка /pending
 SOURCE_CODE_LEN = 24  # длина случайного кода в рекламной ссылке
 
 UNITS = [
@@ -1067,6 +1068,107 @@ async def on_status(cb: CallbackQuery, bot: Bot) -> None:
     await refresh_cards(bot, app_id)
 
 
+def pending_leads(chat_id: int, page: int) -> tuple[int, int, list[tuple]]:
+    """Необработанные заявки (статус «Новая»), у которых есть карточка в этом чате.
+    Возвращает (всего, номер страницы после выравнивания, строки страницы)."""
+    join = "FROM applications a JOIN lead_messages m ON m.app_id = a.id AND m.chat_id = ?"
+    where = "WHERE COALESCE(a.status, 'new') = 'new'"
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        total = db.execute(f"SELECT COUNT(*) {join} {where}", (chat_id,)).fetchone()[0]
+        pages = max(1, -(-total // PENDING_PER_PAGE))
+        page = min(max(page, 0), pages - 1)
+        rows = db.execute(
+            "SELECT a.id, a.name, m.message_id,"
+            " CAST((julianday('now') - julianday(a.created_at)) * 1440 AS INTEGER)"
+            f" {join} {where} ORDER BY a.id LIMIT ? OFFSET ?",
+            (chat_id, PENDING_PER_PAGE, page * PENDING_PER_PAGE),
+        ).fetchall()
+    return total, page, rows
+
+
+def pending_view(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    total, page, rows = pending_leads(chat_id, page)
+    if not total:
+        return (
+            "✅ <b>Необработанных заявок нет.</b>",
+            InlineKeyboardMarkup(inline_keyboard=[[btn("🔄 Обновить", "pq:0")]]),
+        )
+    pages = -(-total // PENDING_PER_PAGE)
+    keyboard = []
+    for app_id, name, message_id, waited in rows:
+        label = f"#{app_id} · {(name or 'без имени')[:18]} · {fmt_wait(waited)}"
+        if chat_id < -10**12:
+            # Супергруппа: кнопка-ссылка сразу открывает карточку заявки.
+            link = f"https://t.me/c/{-chat_id - 10**12}/{message_id}"
+            keyboard.append([InlineKeyboardButton(text=label, url=link)])
+        else:
+            keyboard.append([btn(label, f"pqo:{app_id}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("⬅️", f"pq:{page - 1}"))
+        nav.append(btn(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(btn("➡️", f"pq:{page + 1}"))
+        keyboard.append(nav)
+    keyboard.append([btn("🔄 Обновить", f"pq:{page}")])
+    text = (
+        f"📥 <b>Необработанные заявки: {total}</b>\n\n"
+        "Самые старые — сверху. Нажмите на заявку, чтобы перейти к её карточке."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+@leads.message(Command("pending"), F.chat.id.in_(ADMIN_CHAT_SET))
+async def on_pending_cmd(message: Message) -> None:
+    if message.from_user is None or not can_manage(message.from_user.id):
+        return
+    text, markup = pending_view(message.chat.id, 0)
+    await message.answer(text, reply_markup=markup)
+
+
+@leads.callback_query(F.data.startswith("pq:"), F.message.chat.id.in_(ADMIN_CHAT_SET))
+async def on_pending_page(cb: CallbackQuery) -> None:
+    if not can_manage(cb.from_user.id):
+        await cb.answer("У вас нет прав", show_alert=True)
+        return
+    try:
+        page = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer()
+        return
+    text, markup = pending_view(cb.message.chat.id, page)
+    with suppress(TelegramBadRequest):  # «message is not modified», если ничего не изменилось
+        await cb.message.edit_text(text, reply_markup=markup)
+    await cb.answer()
+
+
+@leads.callback_query(F.data == "noop", F.message.chat.id.in_(ADMIN_CHAT_SET))
+async def on_noop(cb: CallbackQuery) -> None:
+    await cb.answer()
+
+
+@leads.callback_query(F.data.startswith("pqo:"), F.message.chat.id.in_(ADMIN_CHAT_SET))
+async def on_pending_open(cb: CallbackQuery, bot: Bot) -> None:
+    """Запасной вариант для чатов, где нельзя сделать ссылку на сообщение."""
+    if not can_manage(cb.from_user.id):
+        await cb.answer("У вас нет прав", show_alert=True)
+        return
+    try:
+        app_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer()
+        return
+    refs = [m for c, m in lead_message_refs(app_id) if c == cb.message.chat.id]
+    await cb.answer()
+    if refs:
+        await bot.send_message(
+            cb.message.chat.id,
+            f"👆 Заявка #{app_id}",
+            reply_parameters=ReplyParameters(message_id=refs[0], allow_sending_without_reply=True),
+        )
+
+
 @leads.message(
     F.chat.id.in_(ADMIN_CHAT_SET), F.reply_to_message, F.text, ~F.text.startswith("/")
 )
@@ -1084,7 +1186,11 @@ async def on_note(message: Message, bot: Bot) -> None:
 
 
 def fmt_wait(minutes: int) -> str:
-    return f"{minutes // 60} ч {minutes % 60:02d} мин" if minutes >= 60 else f"{minutes} мин"
+    if minutes >= 1440:
+        return f"{minutes // 1440} д {minutes % 1440 // 60} ч"
+    if minutes >= 60:
+        return f"{minutes // 60} ч {minutes % 60:02d} мин"
+    return f"{minutes} мин"
 
 
 async def send_reminders(bot: Bot) -> None:
@@ -1589,6 +1695,12 @@ async def setup_commands(bot: Bot) -> None:
     for admin_id in ADMIN_USER_IDS:
         with suppress(TelegramBadRequest):
             await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+    for chat_id in ADMIN_IDS:
+        with suppress(TelegramBadRequest, TelegramForbiddenError):
+            await bot.set_my_commands(
+                [BotCommand(command="pending", description="Необработанные заявки")],
+                scope=BotCommandScopeChat(chat_id=chat_id),
+            )
 
 
 async def main() -> None:
