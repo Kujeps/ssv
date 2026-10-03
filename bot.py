@@ -88,6 +88,10 @@ CHOICES = {
 # Шаги, которые нельзя пропустить. Остальные можно (но нужен хотя бы один контакт).
 REQUIRED_STEPS = {"name", "gender", "medical", "age", "city", "unit"}
 
+# Пока заявка человека в одном из этих статусов, новую он подать не может.
+# После «Согласился» / «Отказался» / «Мусор» повторная заявка снова разрешена.
+BLOCKING_STATUSES = ("new", "work", "nocall")
+
 # Статусы заявок: ключ -> (значок, название).
 STATUSES = {
     "new": ("🆕", "Новая"),
@@ -221,6 +225,17 @@ ERRORS = {
     "comment": "Слишком длинно — сократите, пожалуйста, до 500 символов.",
 }
 
+PENDING_REVIEW = (
+    "⏳ <b>Ваша заявка на рассмотрении</b>\n\n"
+    "Мы получили вашу заявку от {when} и скоро свяжемся с вами. "
+    "Пожалуйста, подождите — подавать заявку повторно не нужно."
+)
+PENDING_WORK = (
+    "🔧 <b>Ваша заявка уже в работе</b>\n\n"
+    "Менеджер занимается вашей заявкой от {when} и свяжется с вами. "
+    "Пожалуйста, подождите — подавать заявку повторно не нужно."
+)
+
 BTN_SHARE = "📱 Поделиться номером"
 BTN_SKIP = "⏭ Пропустить"
 BTN_BACK = "⬅️ Назад"
@@ -299,7 +314,11 @@ def init_db() -> None:
         )
         # Миграции: столбцы, появившиеся после первых версий. Старые заявки
         # получают статус «Новая», остальные новые поля у них пустые.
+        had_legacy_flag = "legacy" in {
+            row[1] for row in db.execute("PRAGMA table_info(applications)")
+        }
         ensure_columns(db, "applications", {
+            "legacy": "INTEGER DEFAULT 0",
             "gender": "TEXT",
             "medical": "TEXT",
             "age": "INTEGER",
@@ -329,6 +348,13 @@ def init_db() -> None:
             """
         )
         db.execute("CREATE INDEX IF NOT EXISTS idx_lead_messages_app ON lead_messages (app_id)")
+        if not had_legacy_flag:
+            # Заявки, поданные до появления карточек со статусами, обработать кнопками
+            # нельзя — они не должны блокировать новые заявки этих людей навсегда.
+            db.execute(
+                "UPDATE applications SET legacy = 1"
+                " WHERE id NOT IN (SELECT app_id FROM lead_messages)"
+            )
         # Рекламные ссылки: случайный код в ссылке -> понятное название для админа.
         db.execute(
             """
@@ -502,6 +528,20 @@ def save_application(user: User, data: dict) -> int:
             ),
         )
         return cur.lastrowid
+
+
+def active_application(user_id: int) -> dict | None:
+    """Заявка человека, которая ещё ждёт обработки (блокирует подачу новой)."""
+    marks = ",".join("?" * len(BLOCKING_STATUSES))
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT id, created_at, COALESCE(status, 'new') AS status FROM applications"
+            " WHERE user_id = ? AND COALESCE(legacy, 0) = 0"
+            f" AND COALESCE(status, 'new') IN ({marks}) ORDER BY id DESC LIMIT 1",
+            (user_id, *BLOCKING_STATUSES),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def get_application(app_id: int) -> dict | None:
@@ -845,6 +885,11 @@ def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
 
 # ---------- карточка заявки в группе ----------
 
+def pending_notice(app: dict) -> str:
+    template = PENDING_WORK if app["status"] == "work" else PENDING_REVIEW
+    return template.format(when=fmt_ts(app["created_at"]))
+
+
 def lead_text(app: dict) -> str:
     status = app["status"]
     icon, label = STATUSES.get(status, STATUSES["new"])
@@ -1072,7 +1117,9 @@ async def reminder_loop(bot: Bot) -> None:
 
 # ---------- личка: анкета и админ-команды ----------
 
-async def notify_start(bot: Bot, user: User, is_new: bool, source: str | None) -> None:
+async def notify_start(
+    bot: Bot, user: User, is_new: bool, source: str | None, pending: dict | None = None
+) -> None:
     label = "🆕 Новый пользователь запустил бота" if is_new else "🔁 Пользователь снова нажал /start"
     username = f"@{user.username}" if user.username else "нет username"
     text = (
@@ -1082,6 +1129,8 @@ async def notify_start(bot: Bot, user: User, is_new: bool, source: str | None) -
     )
     if source:
         text += f"\n🔖 Источник: <b>{escape(source_label(source))}</b>"
+    if pending:
+        text += f"\n⏳ Заявка #{pending['id']} уже ждёт обработки"
     for admin_id in ADMIN_USER_IDS:
         try:
             await bot.send_message(admin_id, text)
@@ -1096,10 +1145,14 @@ async def on_start(
     source = parse_source(command.args)
     is_new = not had_started_before(message.from_user.id)
     touch_funnel(message.from_user, "started_at", source)
-    await notify_start(bot, message.from_user, is_new, source)
+    pending = active_application(message.from_user.id)
+    await notify_start(bot, message.from_user, is_new, source, pending)
     await clear_prev(bot, message.chat.id, await state.get_data())
     await state.clear()
-    await message.answer(GREETING, reply_markup=apply_keyboard())
+    if pending:
+        await message.answer(pending_notice(pending))
+    else:
+        await message.answer(GREETING, reply_markup=apply_keyboard())
 
 
 @private.message(Command("cancel"))
@@ -1362,6 +1415,12 @@ async def on_broadcast_send(cb: CallbackQuery, state: FSMContext, bot: Bot) -> N
 
 @private.callback_query(F.data == "apply")
 async def on_apply(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    pending = active_application(cb.from_user.id)
+    if pending:
+        await cb.answer("Ваша заявка уже на рассмотрении", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await cb.message.edit_text(pending_notice(pending), reply_markup=None)
+        return
     await cb.answer()
     touch_funnel(cb.from_user, "started_form_at")
     with suppress(TelegramBadRequest):
@@ -1383,6 +1442,12 @@ async def on_send(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if data is None:
         return
     await state.clear()
+    pending = active_application(cb.from_user.id)
+    if pending:
+        await cb.answer("Ваша заявка уже на рассмотрении", show_alert=True)
+        with suppress(TelegramBadRequest):
+            await cb.message.edit_text(pending_notice(pending), reply_markup=None)
+        return
     app_id = save_application(cb.from_user, data)
     touch_funnel(cb.from_user, "completed_at")
     await send_lead_cards(bot, app_id)
@@ -1500,6 +1565,10 @@ async def on_broadcast_confirm_other(message: Message) -> None:
 
 @private.message()
 async def on_anything(message: Message) -> None:
+    pending = active_application(message.from_user.id)
+    if pending:
+        await message.answer(pending_notice(pending))
+        return
     await message.answer(
         "Чтобы оставить заявку, нажмите кнопку ниже 👇", reply_markup=apply_keyboard()
     )
