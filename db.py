@@ -1,0 +1,949 @@
+"""Работа с базой данных (SQLite): заявки, очередь, модераторы, архив, статистика."""
+import re
+import secrets
+import sqlite3
+import string
+from contextlib import closing
+from datetime import datetime, timedelta
+from io import BytesIO
+
+from openpyxl import Workbook
+from openpyxl.styles import Font
+
+import config
+from config import (
+    BLOCKING_STATUSES, FINAL_STATUSES, HOLD_MINUTES, HOLD_WARN_MINUTES,
+    MSK, PER_PAGE, REMIND_MAX, SOURCE_CODE_LEN, STATUSES, TZ_BY_LABEL,
+)
+from utils import (
+    call_time_display, client_local, fmt_ts, lead_priority, norm_phone, parse_utc, safe_cell,
+    tz_text, utc_now, utc_str,
+)
+
+
+def _pylower(value):
+    return value.lower() if isinstance(value, str) else value
+
+
+def connect() -> sqlite3.Connection:
+    """Соединение с БД. SQLite сам не понимает регистр кириллицы — добавляем свою функцию."""
+    db = sqlite3.connect(config.DB_PATH)
+    db.create_function("pylower", 1, _pylower)
+    return db
+
+
+def ensure_columns(db: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _log(db, app_id: int, status: str, by_id: int, by_name: str, kind: str,
+         holder_id: int | None = None) -> None:
+    """История смен статуса. kind: take, take_cb, final, nocall, release, timeout,
+    cb_timeout, admin, remove_mod, migrate."""
+    db.execute(
+        "INSERT INTO status_history (app_id, status, by_id, by_name, kind, holder_id)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (app_id, status, by_id, by_name, kind, holder_id),
+    )
+
+
+def init_db() -> None:
+    with closing(connect()) as db, db:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                username TEXT,
+                full_name TEXT,
+                name TEXT,
+                phone TEXT,
+                telegram TEXT,
+                max_contact TEXT,
+                whatsapp TEXT
+            )
+            """
+        )
+        # Воронка для статистики: одна строка на пользователя, у каждого этапа
+        # (запустил бота / начал заявку / завершил заявку) — своя отметка времени.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS funnel (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                started_at TEXT,
+                started_form_at TEXT,
+                completed_at TEXT
+            )
+            """
+        )
+        ensure_columns(db, "applications", {
+            "legacy": "INTEGER DEFAULT 0",
+            "gender": "TEXT",
+            "medical": "TEXT",
+            "age": "INTEGER",
+            "city": "TEXT",
+            "unit": "TEXT",
+            "served": "TEXT",
+            "call_time": "TEXT",
+            "comment": "TEXT",
+            "source": "TEXT",
+            "status": "TEXT DEFAULT 'new'",
+            "status_by": "TEXT",
+            "status_by_id": "INTEGER",
+            "status_at": "TEXT",
+            "reminded_at": "TEXT",
+            "remind_count": "INTEGER DEFAULT 0",
+            # Очередь модераторов.
+            "tz_offset": "INTEGER",       # часовой пояс клиента: часы от Москвы
+            "assigned_to": "INTEGER",     # модератор, который взял заявку
+            "assigned_name": "TEXT",
+            "taken_at": "TEXT",           # когда взята (для таймера на обработку)
+            "callback_at": "TEXT",        # когда перезвонить (после недозвона), UTC
+            "attempts": "INTEGER DEFAULT 0",
+            "queued_at": "TEXT",          # когда попала в очередь (подана или возвращена)
+            "warned": "INTEGER DEFAULT 0",
+            "cb_notified": "INTEGER DEFAULT 0",
+        })
+        ensure_columns(db, "funnel", {"blocked_at": "TEXT", "source": "TEXT"})
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_messages (
+                app_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+            """
+        )
+        ensure_columns(db, "lead_messages", {"view": "TEXT DEFAULT 'admin'"})
+        db.execute("CREATE INDEX IF NOT EXISTS idx_lead_messages_app ON lead_messages (app_id)")
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                by_id INTEGER,
+                by_name TEXT,
+                text TEXT
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS status_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                status TEXT,
+                by_id INTEGER,
+                by_name TEXT
+            )
+            """
+        )
+        ensure_columns(db, "status_history", {"kind": "TEXT", "holder_id": "INTEGER"})
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sources (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                created_by INTEGER
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS moderators (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                username TEXT,
+                added_by INTEGER,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                notice_id INTEGER
+            )
+            """
+        )
+        _migrate_queue(db)
+
+
+def _migrate_queue(db: sqlite3.Connection) -> None:
+    """Все необработанные заявки (в том числе из времён группы менеджеров) — в очередь.
+    Условие идемпотентно: у «В работе» / «Не дозвонились» теперь всегда есть модератор."""
+    db.execute("UPDATE applications SET status = 'new' WHERE status IS NULL")
+    db.execute(
+        "UPDATE applications SET queued_at = created_at WHERE queued_at IS NULL AND status = 'new'"
+    )
+    rows = db.execute(
+        "SELECT id FROM applications WHERE status IN ('work', 'nocall') AND assigned_to IS NULL"
+    ).fetchall()
+    for (app_id,) in rows:
+        db.execute(
+            "UPDATE applications SET status = 'new', status_by = NULL, status_by_id = NULL,"
+            " status_at = NULL, queued_at = CURRENT_TIMESTAMP, remind_count = 0,"
+            " reminded_at = NULL, taken_at = NULL, callback_at = NULL WHERE id = ?",
+            (app_id,),
+        )
+        _log(db, app_id, "new", 0, "Система", "migrate")
+
+
+# ---------- воронка и рассылка ----------
+
+def touch_funnel(user, stage: str, source: str | None = None) -> None:
+    assert stage in ("started_at", "started_form_at", "completed_at")
+    with closing(connect()) as db, db:
+        # Источник (метка рекламы) запоминается по первому заходу с меткой.
+        db.execute(
+            "INSERT INTO funnel (user_id, username, full_name, source) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET username = excluded.username,"
+            " full_name = excluded.full_name,"
+            " source = COALESCE(funnel.source, excluded.source)",
+            (user.id, user.username, user.full_name, source),
+        )
+        db.execute(
+            f"UPDATE funnel SET {stage} = COALESCE({stage}, CURRENT_TIMESTAMP) WHERE user_id = ?",
+            (user.id,),
+        )
+
+
+def had_started_before(user_id: int) -> bool:
+    with closing(connect()) as db:
+        row = db.execute("SELECT started_at FROM funnel WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row[0])
+
+
+def get_broadcast_recipients() -> list[int]:
+    """Все, кто хоть раз нажимал /start и не заблокировал бота."""
+    with closing(connect()) as db:
+        rows = db.execute(
+            "SELECT user_id FROM funnel WHERE started_at IS NOT NULL AND blocked_at IS NULL"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def mark_blocked(user_id: int) -> None:
+    with closing(connect()) as db, db:
+        db.execute("UPDATE funnel SET blocked_at = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
+
+
+# ---------- рекламные источники ----------
+
+def source_names() -> dict[str, str]:
+    with closing(connect()) as db:
+        return dict(db.execute("SELECT code, name FROM sources").fetchall())
+
+
+def source_label(code: str | None) -> str | None:
+    """Название источника по коду из ссылки (неизвестный код показываем как есть)."""
+    return source_names().get(code, code) if code else None
+
+
+def source_name_taken(name: str) -> bool:
+    return any(n.casefold() == name.casefold() for n in source_names().values())
+
+
+def create_source(name: str, user_id: int) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    with closing(connect()) as db, db:
+        while True:
+            code = "".join(secrets.choice(alphabet) for _ in range(SOURCE_CODE_LEN))
+            if not db.execute("SELECT 1 FROM sources WHERE code = ?", (code,)).fetchone():
+                break
+        db.execute(
+            "INSERT INTO sources (code, name, created_by) VALUES (?, ?, ?)", (code, name, user_id)
+        )
+    return code
+
+
+def list_sources(limit: int = 20) -> tuple[int, list[tuple]]:
+    """Последние созданные ссылки с числами: запустили / начали заявку / подали."""
+    with closing(connect()) as db:
+        total = db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        rows = db.execute(
+            "SELECT s.code, s.name,"
+            " COUNT(f.user_id) FILTER (WHERE f.started_at IS NOT NULL),"
+            " COUNT(f.user_id) FILTER (WHERE f.started_form_at IS NOT NULL),"
+            " COUNT(f.user_id) FILTER (WHERE f.completed_at IS NOT NULL)"
+            " FROM sources s LEFT JOIN funnel f ON f.source = s.code"
+            " GROUP BY s.code ORDER BY s.rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return total, rows
+
+
+def used_sources() -> list[tuple[str, str]]:
+    """Источники, по которым есть заявки: (код, название)."""
+    names = source_names()
+    with closing(connect()) as db:
+        codes = [r[0] for r in db.execute(
+            "SELECT source FROM applications WHERE source IS NOT NULL"
+            " GROUP BY source ORDER BY COUNT(*) DESC LIMIT 20"
+        )]
+    return [(c, names.get(c, c)) for c in codes]
+
+
+# ---------- заявки ----------
+
+def save_application(user, data: dict) -> int:
+    age = data.get("age")
+    with closing(connect()) as db, db:
+        row = db.execute("SELECT source FROM funnel WHERE user_id = ?", (user.id,)).fetchone()
+        cur = db.execute(
+            "INSERT INTO applications"
+            " (user_id, username, full_name, name, phone, telegram, max_contact, whatsapp,"
+            "  gender, medical, age, city, unit, served, call_time, comment, source,"
+            "  tz_offset, status, queued_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', CURRENT_TIMESTAMP)",
+            (
+                user.id, user.username, user.full_name,
+                data.get("name"), data.get("phone"), data.get("tg"),
+                data.get("max"), data.get("wa"),
+                data.get("gender"), data.get("medical"), int(age) if age else None, data.get("city"),
+                data.get("unit"), data.get("served"), data.get("call_time"),
+                data.get("comment"), row[0] if row else None,
+                TZ_BY_LABEL.get(data.get("tz")),
+            ),
+        )
+        return cur.lastrowid
+
+
+def active_application(user_id: int) -> dict | None:
+    """Заявка человека, которая ещё ждёт обработки (блокирует подачу новой)."""
+    marks = ",".join("?" * len(BLOCKING_STATUSES))
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT id, created_at, COALESCE(status, 'new') AS status FROM applications"
+            f" WHERE user_id = ? AND COALESCE(status, 'new') IN ({marks}) ORDER BY id DESC LIMIT 1",
+            (user_id, *BLOCKING_STATUSES),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_application(app_id: int) -> dict | None:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM applications WHERE id = ?", (app_id,)).fetchone()
+        if row is None:
+            return None
+        notes = db.execute(
+            "SELECT by_name, text, created_at FROM lead_notes WHERE app_id = ? ORDER BY id",
+            (app_id,),
+        ).fetchall()
+    app = dict(row)
+    app["status"] = app["status"] or "new"
+    app["notes"] = [dict(n) for n in notes]
+    return app
+
+
+def save_lead_message(app_id: int, chat_id: int, message_id: int, view: str) -> None:
+    with closing(connect()) as db, db:
+        db.execute(
+            "INSERT OR REPLACE INTO lead_messages (app_id, chat_id, message_id, view)"
+            " VALUES (?, ?, ?, ?)",
+            (app_id, chat_id, message_id, view),
+        )
+
+
+def lead_message_refs(app_id: int) -> list[tuple[int, int, str]]:
+    with closing(connect()) as db:
+        return db.execute(
+            "SELECT chat_id, message_id, COALESCE(view, 'admin') FROM lead_messages WHERE app_id = ?",
+            (app_id,),
+        ).fetchall()
+
+
+def add_note(app_id: int, by_id: int, by_name: str, text: str) -> None:
+    with closing(connect()) as db, db:
+        db.execute(
+            "INSERT INTO lead_notes (app_id, by_id, by_name, text) VALUES (?, ?, ?, ?)",
+            (app_id, by_id, by_name, text),
+        )
+
+
+def get_history(app_id: int) -> list[dict]:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT status, by_name, kind, created_at FROM status_history WHERE app_id = ? ORDER BY id",
+            (app_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------- модераторы ----------
+
+def add_moderator(user_id: int, name: str | None, username: str | None, added_by: int) -> bool:
+    """True — добавлен новый, False — уже был (данные обновлены)."""
+    with closing(connect()) as db, db:
+        existed = db.execute("SELECT 1 FROM moderators WHERE user_id = ?", (user_id,)).fetchone()
+        db.execute(
+            "INSERT INTO moderators (user_id, name, username, added_by) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET"
+            " name = COALESCE(excluded.name, moderators.name),"
+            " username = COALESCE(excluded.username, moderators.username)",
+            (user_id, name, username, added_by),
+        )
+    return not existed
+
+
+def remove_moderator(user_id: int) -> list[int]:
+    """Убирает модератора; его заявки в работе и «перезвонить» возвращаются в очередь."""
+    with closing(connect()) as db, db:
+        db.execute("DELETE FROM moderators WHERE user_id = ?", (user_id,))
+        rows = db.execute(
+            "SELECT id FROM applications WHERE assigned_to = ? AND status IN ('work', 'nocall')",
+            (user_id,),
+        ).fetchall()
+        for (app_id,) in rows:
+            _requeue(db, app_id, 0, "Система", "remove_mod", user_id)
+    return [r[0] for r in rows]
+
+
+def is_moderator(user_id: int) -> bool:
+    with closing(connect()) as db:
+        return db.execute("SELECT 1 FROM moderators WHERE user_id = ?", (user_id,)).fetchone() is not None
+
+
+def list_moderators() -> list[dict]:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT * FROM moderators ORDER BY added_at, user_id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def moderator_ids() -> list[int]:
+    return [m["user_id"] for m in list_moderators()]
+
+
+def set_notice_id(user_id: int, message_id: int | None) -> None:
+    with closing(connect()) as db, db:
+        db.execute("UPDATE moderators SET notice_id = ? WHERE user_id = ?", (message_id, user_id))
+
+
+def get_notice_id(user_id: int) -> int | None:
+    with closing(connect()) as db:
+        row = db.execute("SELECT notice_id FROM moderators WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else None
+
+
+# ---------- очередь ----------
+
+def queue_count() -> int:
+    with closing(connect()) as db:
+        return db.execute("SELECT COUNT(*) FROM applications WHERE status = 'new'").fetchone()[0]
+
+
+def queue_summary() -> dict:
+    with closing(connect()) as db:
+        return dict(db.execute(
+            "SELECT COALESCE(status, 'new'), COUNT(*) FROM applications"
+            " WHERE COALESCE(status, 'new') IN ('new', 'work', 'nocall') GROUP BY 1"
+        ).fetchall())
+
+
+def active_lead(mod_id: int) -> dict | None:
+    """Заявка, которую модератор сейчас обрабатывает."""
+    with closing(connect()) as db:
+        row = db.execute(
+            "SELECT id FROM applications WHERE status = 'work' AND assigned_to = ?", (mod_id,)
+        ).fetchone()
+    return get_application(row[0]) if row else None
+
+
+def parked_leads(mod_id: int) -> list[dict]:
+    """Недозвонившиеся заявки модератора: когда пора перезванивать — сверху."""
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT id, name, callback_at, attempts, tz_offset FROM applications"
+            " WHERE status = 'nocall' AND assigned_to = ? ORDER BY callback_at, id",
+            (mod_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def take_lead(mod_id: int, mod_name: str, now: datetime | None = None) -> tuple[str, int | None]:
+    """Выдаёт модератору заявку из очереди. Возвращает ('taken' | 'busy' | 'empty', id).
+    Сначала идут те, кому удобно говорить сейчас (по времени клиента), затем самые старые.
+    Пока у модератора есть заявка в работе, новую он не получит ('busy')."""
+    with closing(connect()) as db, db:
+        db.row_factory = sqlite3.Row
+        busy = db.execute(
+            "SELECT id FROM applications WHERE status = 'work' AND assigned_to = ?", (mod_id,)
+        ).fetchone()
+        if busy:
+            return "busy", busy["id"]
+        rows = db.execute(
+            "SELECT id, tz_offset, call_time FROM applications WHERE status = 'new' ORDER BY id"
+        ).fetchall()
+        if not rows:
+            return "empty", None
+        best = min(rows, key=lambda r: (lead_priority(r["tz_offset"], r["call_time"], now), r["id"]))
+        db.execute(
+            "UPDATE applications SET status = 'work', assigned_to = ?, assigned_name = ?,"
+            " taken_at = CURRENT_TIMESTAMP, warned = 0, callback_at = NULL, status_by = ?,"
+            " status_by_id = ?, status_at = CURRENT_TIMESTAMP, remind_count = 0, reminded_at = NULL"
+            " WHERE id = ? AND status = 'new'",
+            (mod_id, mod_name, mod_name, mod_id, best["id"]),
+        )
+        _log(db, best["id"], "work", mod_id, mod_name, "take", mod_id)
+    return "taken", best["id"]
+
+
+def take_callback(mod_id: int, mod_name: str, app_id: int) -> str:
+    """Модератор берёт в работу свою заявку из «Перезвонить»: 'taken' | 'busy' | 'gone'."""
+    with closing(connect()) as db, db:
+        if db.execute(
+            "SELECT 1 FROM applications WHERE status = 'work' AND assigned_to = ?", (mod_id,)
+        ).fetchone():
+            return "busy"
+        row = db.execute(
+            "SELECT 1 FROM applications WHERE id = ? AND status = 'nocall' AND assigned_to = ?",
+            (app_id, mod_id),
+        ).fetchone()
+        if not row:
+            return "gone"
+        db.execute(
+            "UPDATE applications SET status = 'work', taken_at = CURRENT_TIMESTAMP, warned = 0,"
+            " callback_at = NULL, status_by = ?, status_by_id = ?, status_at = CURRENT_TIMESTAMP"
+            " WHERE id = ?",
+            (mod_name, mod_id, app_id),
+        )
+        _log(db, app_id, "work", mod_id, mod_name, "take_cb", mod_id)
+    return "taken"
+
+
+def _owned(db, app_id: int, mod_id: int, statuses: tuple[str, ...]) -> bool:
+    marks = ",".join("?" * len(statuses))
+    return db.execute(
+        f"SELECT 1 FROM applications WHERE id = ? AND assigned_to = ? AND status IN ({marks})",
+        (app_id, mod_id, *statuses),
+    ).fetchone() is not None
+
+
+def finish_lead(app_id: int, mod_id: int, mod_name: str, status: str, note: str | None = None) -> bool:
+    """Итоговый статус (Согласился / Отказался / Мусор). False — заявка уже не у этого модератора."""
+    assert status in FINAL_STATUSES
+    with closing(connect()) as db, db:
+        if not _owned(db, app_id, mod_id, ("work",)):
+            return False
+        db.execute(
+            "UPDATE applications SET status = ?, status_by = ?, status_by_id = ?,"
+            " status_at = CURRENT_TIMESTAMP, taken_at = NULL, warned = 0 WHERE id = ?",
+            (status, mod_name, mod_id, app_id),
+        )
+        _log(db, app_id, status, mod_id, mod_name, "final", mod_id)
+        if note:
+            db.execute(
+                "INSERT INTO lead_notes (app_id, by_id, by_name, text) VALUES (?, ?, ?, ?)",
+                (app_id, mod_id, mod_name, note),
+            )
+    return True
+
+
+def callback_time(option: str, tz_offset: int | None, now: datetime | None = None) -> datetime:
+    """Когда перезвонить: через 1/3 часа или завтра в 10:00 по времени клиента (UTC)."""
+    now = now or utc_now()
+    if option == "1h":
+        return now + timedelta(hours=1)
+    if option == "3h":
+        return now + timedelta(hours=3)
+    # 10:00 по времени клиента: сегодня, если ещё не наступило, иначе завтра.
+    local = client_local(tz_offset, now)
+    target = local.replace(hour=10, minute=0, second=0, microsecond=0)
+    if target <= local:
+        target += timedelta(days=1)
+    return target - timedelta(hours=tz_offset or 0)  # из времени клиента обратно в МСК
+
+
+def postpone_lead(app_id: int, mod_id: int, mod_name: str, option: str,
+                  note: str | None = None) -> int | None:
+    """Недозвон: заявка остаётся за модератором в «Перезвонить». Возвращает число попыток."""
+    with closing(connect()) as db, db:
+        if not _owned(db, app_id, mod_id, ("work",)):
+            return None
+        tz_offset = db.execute("SELECT tz_offset FROM applications WHERE id = ?", (app_id,)).fetchone()[0]
+        when = utc_str(callback_time(option, tz_offset))
+        db.execute(
+            "UPDATE applications SET status = 'nocall', callback_at = ?, attempts = attempts + 1,"
+            " cb_notified = 0, taken_at = NULL, warned = 0, status_by = ?, status_by_id = ?,"
+            " status_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (when, mod_name, mod_id, app_id),
+        )
+        _log(db, app_id, "nocall", mod_id, mod_name, "nocall", mod_id)
+        if note:
+            db.execute(
+                "INSERT INTO lead_notes (app_id, by_id, by_name, text) VALUES (?, ?, ?, ?)",
+                (app_id, mod_id, mod_name, note),
+            )
+        return db.execute("SELECT attempts FROM applications WHERE id = ?", (app_id,)).fetchone()[0]
+
+
+def _requeue(db, app_id: int, by_id: int, by_name: str, kind: str, holder_id: int | None) -> None:
+    db.execute(
+        "UPDATE applications SET status = 'new', assigned_to = NULL, assigned_name = NULL,"
+        " taken_at = NULL, callback_at = NULL, warned = 0, cb_notified = 0,"
+        " queued_at = CURRENT_TIMESTAMP, remind_count = 0, reminded_at = NULL,"
+        " status_by = ?, status_by_id = ?, status_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (by_name, by_id, app_id),
+    )
+    _log(db, app_id, "new", by_id, by_name, kind, holder_id)
+
+
+def release_lead(app_id: int, mod_id: int, mod_name: str, reason: str) -> bool:
+    """Модератор сам возвращает заявку в очередь (причина обязательна)."""
+    with closing(connect()) as db, db:
+        if not _owned(db, app_id, mod_id, ("work", "nocall")):
+            return False
+        _requeue(db, app_id, mod_id, mod_name, "release", mod_id)
+        db.execute(
+            "INSERT INTO lead_notes (app_id, by_id, by_name, text) VALUES (?, ?, ?, ?)",
+            (app_id, mod_id, mod_name, f"Возврат в очередь: {reason}"),
+        )
+    return True
+
+
+def admin_requeue(app_id: int, admin_id: int, admin_name: str) -> tuple[bool, int | None]:
+    """Админ возвращает любую не новую заявку в очередь. Возвращает (успех, прежний модератор)."""
+    with closing(connect()) as db, db:
+        row = db.execute(
+            "SELECT COALESCE(status, 'new'), assigned_to FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if not row or row[0] == "new":
+            return False, None
+        _requeue(db, app_id, admin_id, admin_name, "admin", row[1])
+    return True, row[1]
+
+
+# ---------- фоновые проверки ----------
+
+def expired_holds(now: datetime | None = None) -> list[tuple[int, int]]:
+    """Заявки, которые модератор держит дольше HOLD_MINUTES: (id заявки, id модератора)."""
+    limit = utc_str((now or utc_now()) - timedelta(minutes=HOLD_MINUTES))
+    with closing(connect()) as db:
+        return db.execute(
+            "SELECT id, assigned_to FROM applications WHERE status = 'work' AND taken_at <= ?",
+            (limit,),
+        ).fetchall()
+
+
+def hold_warnings(now: datetime | None = None) -> list[tuple[int, int, int]]:
+    """Скоро истекающие заявки без предупреждения: (id, модератор, минут осталось)."""
+    warn_after = max(HOLD_MINUTES - HOLD_WARN_MINUTES, 0)
+    limit = utc_str((now or utc_now()) - timedelta(minutes=warn_after))
+    with closing(connect()) as db:
+        rows = db.execute(
+            "SELECT id, assigned_to, taken_at FROM applications"
+            " WHERE status = 'work' AND warned = 0 AND taken_at <= ?",
+            (limit,),
+        ).fetchall()
+    result = []
+    for app_id, mod_id, taken_at in rows:
+        left = HOLD_MINUTES - int((((now or utc_now()) - parse_utc(taken_at)).total_seconds()) // 60)
+        result.append((app_id, mod_id, max(left, 0)))
+    return result
+
+
+def mark_warned(app_id: int) -> None:
+    with closing(connect()) as db, db:
+        db.execute("UPDATE applications SET warned = 1 WHERE id = ?", (app_id,))
+
+
+def due_callbacks(now: datetime | None = None) -> list[tuple[int, int]]:
+    """Пора перезванивать, а модератор ещё не уведомлён: (id заявки, id модератора)."""
+    with closing(connect()) as db:
+        return db.execute(
+            "SELECT id, assigned_to FROM applications"
+            " WHERE status = 'nocall' AND cb_notified = 0 AND callback_at <= ?",
+            (utc_str(now),),
+        ).fetchall()
+
+
+def mark_cb_notified(app_id: int) -> None:
+    with closing(connect()) as db, db:
+        db.execute("UPDATE applications SET cb_notified = 1 WHERE id = ?", (app_id,))
+
+
+def overdue_callbacks(now: datetime | None = None) -> list[tuple[int, int]]:
+    """Перезвон просрочен больше чем на CALLBACK_RETURN_HOURS."""
+    limit = utc_str((now or utc_now()) - timedelta(hours=config.CALLBACK_RETURN_HOURS))
+    with closing(connect()) as db:
+        return db.execute(
+            "SELECT id, assigned_to FROM applications WHERE status = 'nocall' AND callback_at <= ?",
+            (limit,),
+        ).fetchall()
+
+
+def system_requeue(app_id: int, kind: str, holder_id: int | None) -> bool:
+    """Автовозврат в очередь (kind: timeout / cb_timeout)."""
+    with closing(connect()) as db, db:
+        row = db.execute(
+            "SELECT status FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if not row or row[0] not in ("work", "nocall"):
+            return False
+        _requeue(db, app_id, 0, "Система", kind, holder_id)
+    return True
+
+
+def due_queue_reminders(now: datetime | None = None) -> list[tuple[int, int]]:
+    """Заявки, которые слишком долго ждут в очереди: (id, минут ожидания)."""
+    limit = utc_str((now or utc_now()) - timedelta(minutes=config.REMIND_AFTER_MIN))
+    with closing(connect()) as db:
+        rows = db.execute(
+            "SELECT id, COALESCE(queued_at, created_at) FROM applications"
+            " WHERE COALESCE(status, 'new') = 'new' AND COALESCE(remind_count, 0) < ?"
+            " AND COALESCE(reminded_at, queued_at, created_at) <= ?",
+            (REMIND_MAX, limit),
+        ).fetchall()
+    n = now or utc_now()
+    return [(i, int((n - parse_utc(q)).total_seconds() // 60)) for i, q in rows]
+
+
+def mark_reminded(app_ids: set[int]) -> None:
+    with closing(connect()) as db, db:
+        db.executemany(
+            "UPDATE applications SET remind_count = COALESCE(remind_count, 0) + 1,"
+            " reminded_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [(i,) for i in app_ids],
+        )
+
+
+# ---------- архив: фильтры и поиск ----------
+
+def period_bounds(key: str, now: datetime | None = None) -> tuple[str, str | None]:
+    """Границы периода (в UTC) по местному дню (московскому)."""
+    now = (now or utc_now()).astimezone(MSK)
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if key == "today":
+        start, end = day, None
+    elif key == "yesterday":
+        start, end = day - timedelta(days=1), day
+    elif key == "7d":
+        start, end = day - timedelta(days=6), None
+    else:  # 30d
+        start, end = day - timedelta(days=29), None
+    return utc_str(start), utc_str(end) if end else None
+
+
+def _archive_where(filters: dict, scope_mod: int | None) -> tuple[str, list]:
+    cond, args = [], []
+    if scope_mod is not None:
+        cond.append("a.assigned_to = ?")
+        args.append(scope_mod)
+    if filters.get("status"):
+        cond.append("COALESCE(a.status, 'new') = ?")
+        args.append(filters["status"])
+    if filters.get("mod") is not None:
+        cond.append("a.assigned_to = ?")
+        args.append(filters["mod"])
+    if filters.get("source"):
+        cond.append("a.source = ?")
+        args.append(filters["source"])
+    if filters.get("period"):
+        start, end = period_bounds(filters["period"])
+        cond.append("COALESCE(a.status_at, a.created_at) >= ?")
+        args.append(start)
+        if end:
+            cond.append("COALESCE(a.status_at, a.created_at) < ?")
+            args.append(end)
+    q = (filters.get("q") or "").strip()
+    if re.fullmatch(r"#\d+", q):  # «#12» — строго заявка с таким номером
+        cond.append("a.id = ?")
+        args.append(int(q[1:]))
+    elif q:
+        like = f"%{q.lower().lstrip('#')}%"
+        parts = [f"pylower(a.{c}) LIKE ?" for c in
+                 ("name", "city", "full_name", "username", "phone", "telegram", "max_contact", "whatsapp")]
+        args += [like] * len(parts)
+        parts += ["CAST(a.id AS TEXT) = ?", "CAST(a.user_id AS TEXT) = ?"]
+        args += [q.lstrip("#"), q]
+        phone = norm_phone(q)
+        if phone:
+            parts += ["a.phone = ?", "a.max_contact = ?", "a.whatsapp = ?", "a.telegram = ?"]
+            args += [phone] * 4
+        cond.append("(" + " OR ".join(parts) + ")")
+    return (" WHERE " + " AND ".join(cond)) if cond else "", args
+
+
+def archive_page(filters: dict, page: int, scope_mod: int | None = None,
+                 per_page: int = PER_PAGE) -> tuple[int, int, list[dict]]:
+    """Страница списка заявок: (всего, номер страницы после выравнивания, строки). Новые сверху."""
+    where, args = _archive_where(filters, scope_mod)
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        total = db.execute(f"SELECT COUNT(*) FROM applications a{where}", args).fetchone()[0]
+        pages = max(1, -(-total // per_page))
+        page = min(max(page, 0), pages - 1)
+        rows = db.execute(
+            "SELECT a.id, a.name, COALESCE(a.status, 'new') AS status, a.created_at,"
+            " a.status_at, a.assigned_name, a.city"
+            f" FROM applications a{where} ORDER BY a.id DESC LIMIT ? OFFSET ?",
+            (*args, per_page, page * per_page),
+        ).fetchall()
+    return total, page, [dict(r) for r in rows]
+
+
+def archive_moderators() -> list[tuple[int, str]]:
+    """Модераторы, у которых есть заявки (в том числе уже удалённые)."""
+    with closing(connect()) as db:
+        rows = db.execute(
+            "SELECT assigned_to, MAX(assigned_name) FROM applications"
+            " WHERE assigned_to IS NOT NULL GROUP BY assigned_to ORDER BY MAX(assigned_name)"
+        ).fetchall()
+    return [(r[0], r[1] or str(r[0])) for r in rows]
+
+
+# ---------- статистика ----------
+
+def get_stats() -> dict:
+    with closing(connect()) as db:
+        row = db.execute(
+            "SELECT"
+            " COUNT(*) FILTER (WHERE started_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE started_form_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE completed_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE blocked_at IS NOT NULL)"
+            " FROM funnel"
+        ).fetchone()
+        total_apps = db.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
+        by_status = dict(db.execute(
+            "SELECT COALESCE(status, 'new'), COUNT(*) FROM applications GROUP BY 1"
+        ).fetchall())
+        sources = db.execute(
+            "SELECT COALESCE(source, ''),"
+            " COUNT(*) FILTER (WHERE started_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE started_form_at IS NOT NULL),"
+            " COUNT(*) FILTER (WHERE completed_at IS NOT NULL)"
+            " FROM funnel GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
+        ).fetchall()
+    started, started_form, completed, blocked = row
+    return {
+        "started": started,
+        "started_form": started_form,
+        "completed": completed,
+        "blocked": blocked,
+        "total_apps": total_apps,
+        "by_status": by_status,
+        "sources": sources,
+    }
+
+
+def moderator_stats() -> list[dict]:
+    """Работа каждого модератора по истории статусов."""
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        mods = {r["user_id"]: r["name"] for r in db.execute("SELECT user_id, name FROM moderators")}
+        hist = db.execute(
+            "SELECT app_id, status, by_id, by_name, kind, holder_id, created_at"
+            " FROM status_history ORDER BY id"
+        ).fetchall()
+        active = {r["assigned_to"]: r["id"] for r in db.execute(
+            "SELECT id, assigned_to FROM applications WHERE status = 'work' AND assigned_to IS NOT NULL")}
+        parked: dict[int, int] = {}
+        for r in db.execute(
+            "SELECT assigned_to, COUNT(*) AS n FROM applications WHERE status = 'nocall'"
+            " AND assigned_to IS NOT NULL GROUP BY assigned_to"
+        ):
+            parked[r["assigned_to"]] = r["n"]
+    stats: dict[int, dict] = {}
+
+    def entry(uid: int, name: str | None = None) -> dict:
+        e = stats.setdefault(uid, {
+            "user_id": uid, "name": mods.get(uid) or name or str(uid), "takes": 0,
+            "agreed": 0, "refused": 0, "junk": 0, "nocalls": 0, "releases": 0, "timeouts": 0,
+            "durations": [], "active": active.get(uid), "parked": parked.get(uid, 0),
+            "is_active": uid in mods,
+        })
+        if name and not mods.get(uid):
+            e["name"] = name
+        return e
+
+    for uid, name in mods.items():
+        entry(uid, name)
+    last_take: dict[tuple[int, int], str] = {}
+    for h in hist:
+        kind, uid = h["kind"], h["by_id"]
+        if kind in ("take", "take_cb"):
+            entry(uid, h["by_name"])["takes"] += 1
+            last_take[(h["app_id"], uid)] = h["created_at"]
+        elif kind == "final":
+            e = entry(uid, h["by_name"])
+            e[h["status"]] += 1
+            t0 = parse_utc(last_take.get((h["app_id"], uid)))
+            t1 = parse_utc(h["created_at"])
+            if t0 and t1:
+                e["durations"].append((t1 - t0).total_seconds() / 60)
+        elif kind == "nocall":
+            entry(uid, h["by_name"])["nocalls"] += 1
+        elif kind == "release":
+            entry(uid, h["by_name"])["releases"] += 1
+        elif kind in ("timeout", "cb_timeout") and h["holder_id"]:
+            entry(h["holder_id"])["timeouts"] += 1
+    result = []
+    for e in stats.values():
+        d = e.pop("durations")
+        e["avg_minutes"] = int(sum(d) / len(d)) if d else None
+        result.append(e)
+    return sorted(result, key=lambda e: (not e["is_active"], e["name"].lower()))
+
+
+# ---------- Excel ----------
+
+EXPORT_COLUMNS = [
+    ("#", 5), ("Дата и время", 17), ("Имя", 16), ("Телефон", 16), ("Telegram", 14),
+    ("MAX", 14), ("WhatsApp", 14), ("Пол", 10), ("Мед. образование", 16), ("Возраст", 9),
+    ("Город", 16), ("Часовой пояс", 18), ("Подразделение", 20), ("Служба ранее", 18),
+    ("Удобное время", 30), ("Комментарий клиента", 30), ("Источник", 14), ("Статус", 16),
+    ("Модератор", 16), ("Недозвонов", 11), ("Статус изменён", 17), ("Заметки", 40),
+    ("Профиль", 20), ("Username", 14), ("User ID", 12),
+]
+
+
+def build_export_xlsx(filters: dict | None = None, scope_mod: int | None = None) -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Заявки"
+    ws.append([name for name, _ in EXPORT_COLUMNS])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    where, args = _archive_where(filters or {}, scope_mod)
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        names = {r[0]: r[1] for r in db.execute("SELECT code, name FROM sources")}
+        apps = db.execute(f"SELECT * FROM applications a{where} ORDER BY a.id", args).fetchall()
+        notes: dict[int, list[str]] = {}
+        for n in db.execute(
+            "SELECT app_id, by_name, text, created_at FROM lead_notes ORDER BY id"
+        ):
+            notes.setdefault(n["app_id"], []).append(
+                f"{n['by_name']} ({fmt_ts(n['created_at'])}): {n['text']}"
+            )
+    for a in apps:
+        status = a["status"] or "new"
+        ws.append([safe_cell(v) for v in [
+            a["id"], fmt_ts(a["created_at"], "%d.%m.%Y %H:%M"), a["name"], a["phone"],
+            a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["medical"], a["age"],
+            a["city"], tz_text(a["tz_offset"]), a["unit"], a["served"],
+            call_time_display(a["call_time"], a["tz_offset"]), a["comment"],
+            names.get(a["source"], a["source"]), STATUSES.get(status, STATUSES["new"])[1],
+            a["assigned_name"], a["attempts"] or 0,
+            fmt_ts(a["status_at"], "%d.%m.%Y %H:%M") if a["status_at"] else "",
+            "\n".join(notes.get(a["id"], [])),
+            a["full_name"], f"@{a['username']}" if a["username"] else "", a["user_id"],
+        ]])
+    for i, (_, width) in enumerate(EXPORT_COLUMNS, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
