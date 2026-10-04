@@ -81,6 +81,13 @@ def tz_text(tz_offset: int | None) -> str | None:
     return None if tz_offset is None else TZ_LABEL_BY_OFFSET.get(tz_offset, f"МСК{tz_offset:+d}")
 
 
+def tz_short(tz_offset: int | None) -> str | None:
+    """«МСК» / «МСК+2» — короткая пометка часового пояса."""
+    if tz_offset is None:
+        return None
+    return "МСК" if tz_offset == 0 else f"МСК{tz_offset:+d}"
+
+
 def call_time_display(call_time: str | None, tz_offset: int | None) -> str | None:
     """«Вечер (17–21)» + пояс клиента -> то же окно по Москве."""
     if not call_time:
@@ -105,3 +112,63 @@ def lead_priority(tz_offset: int | None, call_time: str | None, now: datetime | 
     if window is None:
         return 1
     return 0 if window[0] <= hour < window[1] else 2
+
+
+# ---------- анкета простым текстом (для таблицы и Excel) ----------
+
+def age_text(n: int) -> str:
+    if 11 <= n % 100 <= 14:
+        return f"{n} лет"
+    return f"{n} {'год' if n % 10 == 1 else 'года' if 2 <= n % 10 <= 4 else 'лет'}"
+
+
+def anketa_lines(app: dict) -> list[str]:
+    """Анкета клиента в виде коротких строк (без разметки)."""
+    gender = {"Мужской": "муж.", "Женский": "жен."}.get(app.get("gender"), app.get("gender"))
+    head = " · ".join(x for x in (app.get("name"), gender, age_text(app["age"]) if app.get("age") else None) if x)
+    contacts = " · ".join(x for x in (
+        app.get("phone"), app.get("telegram"),
+        f"MAX {app['max_contact']}" if app.get("max_contact") else None,
+        f"WhatsApp {app['whatsapp']}" if app.get("whatsapp") else None,
+    ) if x)
+    tz = tz_short(app.get("tz_offset"))
+    place = " · ".join(x for x in (
+        f"{app['city']} ({tz})" if app.get("city") and tz else app.get("city") or tz_text(app.get("tz_offset")),
+        app.get("unit"), app.get("served"),
+        f"мед.: {app['medical']}" if app.get("medical") else None,
+    ) if x)
+    call = call_time_display(app.get("call_time"), app.get("tz_offset"))
+    return [x for x in (head, contacts, place, f"Звонить: {call}" if call else None) if x]
+
+
+def parse_when(text: str, now: datetime | None = None) -> datetime | None:
+    """«07.10 18:00», «18:30», «завтра 10:00», «сегодня 20:00» (по Москве) -> время в UTC.
+    Прошедшее время не принимается."""
+    now = now or utc_now()
+    local = now.astimezone(MSK)
+    t = text.strip().lower().replace(",", " ")
+    m = re.search(r"(\d{1,2})[:.](\d{2})\s*$", t)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        return None
+    head = t[:m.start()].strip()
+    try:
+        if head == "завтра":
+            day = (local + timedelta(days=1)).date()
+        elif head in ("сегодня", ""):
+            day = local.date()
+        else:
+            d = re.fullmatch(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", head)
+            if not d:
+                return None
+            year = int(d.group(3)) if d.group(3) else local.year
+            year += 2000 if year < 100 else 0
+            day = local.replace(year=year, month=int(d.group(2)), day=int(d.group(1))).date()
+        when = datetime(day.year, day.month, day.day, hour, minute, tzinfo=MSK)
+    except ValueError:
+        return None
+    if head == "" and when <= local:
+        when += timedelta(days=1)  # «18:30» без даты: сегодня, а если уже прошло — завтра
+    return when.astimezone(timezone.utc) if when > local else None

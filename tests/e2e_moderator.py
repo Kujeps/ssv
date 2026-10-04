@@ -29,7 +29,7 @@ async def main():
     for part in ("Заявка #%d" % a1, "+79990000001", "01:00 на обработку", "будет возвращена в список необработанных"):
         assert part in card["text"], (part, card["text"])
     ok("взял заявку: видит контакты и предупреждение «У вас есть 01:00 на обработку…»")
-    assert set(w.datas(card["kb"])) == {f"mv:{a1}:{x}" for x in ("agreed", "refused", "nocall", "junk", "note", "release")}; ok("кнопки: согласился / отказался / недозвонился / мусор / заметка / вернуть")
+    assert set(w.datas(card["kb"])) == {f"mv:{a1}:{x}" for x in ("agreed", "refused", "nocall", "junk", "note", "release")} | {f"tb:n:{a1}"}; ok("кнопки: согласился / отказался / недозвонился / мусор / заметка / вернуть / изменить")
     t = admin_card_text(a1); assert "В работе" in t and "Иван" in t and "Взята" in t; ok("карточка админа обновилась: в работе у Ивана")
     # --- нельзя взять вторую ---
     w.clear(); await w.press(50, "mp:take")
@@ -72,7 +72,7 @@ async def main():
     t = admin_card_text(a4); assert "Недозвонов: <b>1</b>" in t and "Иван" in t; ok("у админа: «Недозвонов: 1», перезвонить во столько-то")
     assert D.active_lead(50) is None; ok("модератор свободен и может брать следующую")
     w.clear(); await w.msg(50, "/start"); p = w.last_to(50)
-    assert "Перезвонить позже: <b>1</b>" in p["text"] and "Взять заявку" in str(w.buttons(p["kb"])); ok("панель: «Перезвонить позже: 1»")
+    assert "В ожидании (перезвонить, дозвонились): <b>1</b>" in p["text"] and "Взять заявку" in str(w.buttons(p["kb"])); ok("панель: «В ожидании: 1»")
     await w.press(50, "mp:cb"); lst = w.last_to(50); assert f"mt:{a4}" in w.datas(lst["kb"]); ok("раздел «Перезвонить» с заявкой")
     await w.press(50, "mp:take"); a5 = D.active_lead(50)["id"]
     w.clear(); await w.press(50, f"mt:{a4}", mid=w.with_kb(50)); assert w.answers[-1][0] == "Сначала завершите текущую заявку"; ok("перезвон нельзя взять, пока в работе другая заявка")

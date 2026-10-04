@@ -10,7 +10,7 @@ from aiogram.types import (
     User,
 )
 
-from config import CHOICES, HOLD_MINUTES, LOCAL_TZ, REQUIRED_STEPS, STATUSES
+from config import CHOICES, HOLD_MINUTES, LOCAL_TZ, OPEN_STATUSES, REQUIRED_STEPS, STATUSES
 from db import (
     active_lead, is_moderator, list_moderators, parked_leads, queue_summary, reminders_enabled,
     source_label,
@@ -105,7 +105,7 @@ def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 def pending_notice(app: dict) -> str:
-    template = PENDING_WORK if app["status"] == "work" else PENDING_REVIEW
+    template = PENDING_WORK if app["status"] in ("work", "reached") else PENDING_REVIEW
     return template.format(when=fmt_ts(app["created_at"]))
 
 
@@ -147,11 +147,15 @@ def lead_text(app: dict, view: str = "admin", viewer_id: int | None = None) -> s
         f"📋 <b>Заявка #{app['id']}</b> · {icon} {label}",
         "",
         card(data, skip_empty=True),
+    ]
+    if app.get("extra"):
+        lines += ["", f"ℹ️ <b>Доп. информация:</b>\n{escape(app['extra'])}"]
+    lines += [
         "",
         f"🔗 <a href=\"tg://user?id={app['user_id']}\">{escape(app['full_name'] or '—')}</a>"
         f" · {escape(username)} · ID <code>{app['user_id']}</code>",
     ]
-    if tz_offset is not None and status in ("new", "work", "nocall"):
+    if tz_offset is not None and (status == "new" or status in OPEN_STATUSES):
         lines.append(f"🕐 У клиента сейчас: <b>{client_local(tz_offset):%H:%M}</b>")
     if app["source"]:
         lines.append(f"🔖 Источник: <b>{escape(source_label(app['source']))}</b>")
@@ -159,6 +163,8 @@ def lead_text(app: dict, view: str = "admin", viewer_id: int | None = None) -> s
     lines.append("")
     if app["assigned_name"] and status != "new":
         lines.append(f"👷 Модератор: <b>{escape(app['assigned_name'])}</b>")
+        if app.get("assigned_at"):
+            lines.append(f"📅 Передана: {fmt_ts(app['assigned_at'])}")
     if status == "work":
         deadline = _deadline(app)
         if view == "mod":
@@ -177,6 +183,10 @@ def lead_text(app: dict, view: str = "admin", viewer_id: int | None = None) -> s
             f"📵 Недозвонов: <b>{app['attempts'] or 1}</b> · перезвонить: "
             f"<b>{fmt_ts(app['callback_at'])}</b>"
         )
+    elif status == "callback":
+        lines.append(f"🔁 Перезвонить: <b>{fmt_ts(app['callback_at'])}</b> МСК")
+    elif status == "reached":
+        lines.append(f"📞 <b>Дозвонились</b> — {escape(app['status_by'] or '—')} · {fmt_ts(app['status_at'])}")
     elif status in ("agreed", "refused", "junk"):
         lines.append(f"{icon} <b>{label}</b> — {escape(app['status_by'] or '—')} · {fmt_ts(app['status_at'])}")
     elif (app["attempts"] or 0) > 0:
@@ -205,15 +215,20 @@ def lead_keyboard(app: dict, view: str = "admin", viewer_id: int | None = None):
         return InlineKeyboardMarkup(inline_keyboard=[
             [btn("✅ Согласился", f"mv:{app_id}:agreed"), btn("❌ Отказался", f"mv:{app_id}:refused")],
             [btn("📵 Не дозвонился", f"mv:{app_id}:nocall"), btn("🗑 Мусор", f"mv:{app_id}:junk")],
-            [btn("✍️ Заметка", f"mv:{app_id}:note"), btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
+            [btn("✍️ Заметка", f"mv:{app_id}:note"), btn("✏️ Изменить", f"tb:n:{app_id}")],
+            [btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
         ])
-    if status == "nocall":
+    if status in OPEN_STATUSES:  # в ожидании: «Не дозвонились» / «Дозвонились» / «Перезвонить»
         return InlineKeyboardMarkup(inline_keyboard=[
             [btn("📞 Позвонить сейчас", f"mt:{app_id}")],
-            [btn("✍️ Заметка", f"mv:{app_id}:note"), btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
+            [btn("✏️ Изменить", f"tb:n:{app_id}"), btn("✍️ Заметка", f"mv:{app_id}:note")],
+            [btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
             [menu],
         ])
-    return InlineKeyboardMarkup(inline_keyboard=[[btn("📥 Взять следующую заявку", "mp:take")], [menu]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("✏️ Изменить", f"tb:n:{app_id}")],
+        [btn("📥 Взять следующую заявку", "mp:take")], [menu],
+    ])
 
 
 # ---------- панели ----------
@@ -235,11 +250,12 @@ def mod_panel(mod_id: int) -> tuple[str, InlineKeyboardMarkup]:
         )
     if parked:
         lines.append(
-            f"🔁 Перезвонить позже: <b>{len(parked)}</b>" + (f" (пора звонить: {due})" if due else "")
+            f"🔁 В ожидании (перезвонить, дозвонились): <b>{len(parked)}</b>"
+            + (f" · пора звонить: {due}" if due else "")
         )
     rows = [[btn(f"📂 Моя заявка #{active['id']}", "mp:active")] if active
             else [btn("📥 Взять заявку", "mp:take")]]
-    rows.append([btn(f"🔁 Перезвонить ({len(parked)})", "mp:cb")])
+    rows.append([btn("📋 Моя таблица", "tb:open"), btn(f"🔁 В ожидании ({len(parked)})", "mp:cb")])
     rows.append([btn("🗂 Мои заявки", "mp:arch"), btn("📊 Моя статистика", "mp:stats")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -250,7 +266,7 @@ def admin_panel(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
         "🛠 <b>Панель администратора</b>",
         "",
         f"📥 В очереди: <b>{summary.get('new', 0)}</b> · 🔧 В работе: <b>{summary.get('work', 0)}</b>"
-        f" · 📵 Перезвонить: <b>{summary.get('nocall', 0)}</b>",
+        f" · 🔁 В ожидании: <b>{sum(summary.get(k, 0) for k in ('nocall', 'callback', 'reached'))}</b>",
         f"👥 Модераторов: <b>{len(list_moderators())}</b>",
     ]
     rows = [
@@ -264,5 +280,6 @@ def admin_panel(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
         active = active_lead(admin_id)
         rows.append([btn(f"📂 Моя заявка #{active['id']}", "mp:active")] if active
                     else [btn("📥 Взять заявку", "mp:take")])
+        rows.append([btn("📋 Моя таблица", "tb:open")])
     rows.append([btn("📝 Подать заявку (проверка формы)", "apply")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)

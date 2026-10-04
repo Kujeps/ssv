@@ -12,12 +12,13 @@ from openpyxl.styles import Font
 
 import config
 from config import (
-    BLOCKING_STATUSES, FINAL_STATUSES, HOLD_MINUTES, HOLD_WARN_MINUTES,
-    MSK, PER_PAGE, SOURCE_CODE_LEN, STATUSES, TZ_BY_LABEL,
+    BLOCKING_STATUSES, CHANGEABLE_STATUSES, EDIT_FIELDS, FINAL_STATUSES, HOLD_MINUTES,
+    HOLD_WARN_MINUTES, MSK, OPEN_STATUSES, PARKED_STATUSES, PER_PAGE, SOURCE_CODE_LEN, STATUSES,
+    TZ_BY_LABEL, TZ_LABEL_BY_OFFSET,
 )
 from utils import (
-    call_time_display, client_local, fmt_ts, lead_priority, norm_phone, parse_utc, safe_cell,
-    tz_text, utc_now, utc_str,
+    anketa_lines, call_time_display, client_local, fmt_ts, lead_priority, norm_phone, parse_utc,
+    safe_cell, tz_text, utc_now, utc_str,
 )
 
 
@@ -37,6 +38,10 @@ def ensure_columns(db: sqlite3.Connection, table: str, columns: dict[str, str]) 
     for name, ddl in columns.items():
         if name not in existing:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _marks(items) -> str:
+    return ",".join("?" * len(items))
 
 
 def _log(db, app_id: int, status: str, by_id: int, by_name: str, kind: str,
@@ -109,6 +114,8 @@ def init_db() -> None:
             "queued_at": "TEXT",          # когда попала в очередь (подана или возвращена)
             "warned": "INTEGER DEFAULT 0",
             "cb_notified": "INTEGER DEFAULT 0",
+            "assigned_at": "TEXT",        # когда заявка передана модератору (первое взятие)
+            "extra": "TEXT",              # «Доп. информация» — свободные пометки модератора
         })
         ensure_columns(db, "funnel", {
             "blocked_at": "TEXT",
@@ -171,6 +178,20 @@ def init_db() -> None:
         db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         db.execute(
             """
+            CREATE TABLE IF NOT EXISTS lead_edits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                by_id INTEGER,
+                by_name TEXT,
+                field TEXT,
+                old TEXT,
+                new TEXT
+            )
+            """
+        )
+        db.execute(
+            """
             CREATE TABLE IF NOT EXISTS start_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -216,7 +237,8 @@ def _migrate_queue(db: sqlite3.Connection) -> None:
         "UPDATE applications SET queued_at = created_at WHERE queued_at IS NULL AND status = 'new'"
     )
     rows = db.execute(
-        "SELECT id FROM applications WHERE status IN ('work', 'nocall') AND assigned_to IS NULL"
+        f"SELECT id FROM applications WHERE status IN ({_marks(OPEN_STATUSES)}) AND assigned_to IS NULL",
+        OPEN_STATUSES,
     ).fetchall()
     for (app_id,) in rows:
         db.execute(
@@ -433,8 +455,8 @@ def remove_moderator(user_id: int) -> list[int]:
     with closing(connect()) as db, db:
         db.execute("DELETE FROM moderators WHERE user_id = ?", (user_id,))
         rows = db.execute(
-            "SELECT id FROM applications WHERE assigned_to = ? AND status IN ('work', 'nocall')",
-            (user_id,),
+            f"SELECT id FROM applications WHERE assigned_to = ? AND status IN ({_marks(OPEN_STATUSES)})",
+            (user_id, *OPEN_STATUSES),
         ).fetchall()
         for (app_id,) in rows:
             _requeue(db, app_id, 0, "Система", "remove_mod", user_id)
@@ -479,7 +501,8 @@ def queue_summary() -> dict:
     with closing(connect()) as db:
         return dict(db.execute(
             "SELECT COALESCE(status, 'new'), COUNT(*) FROM applications"
-            " WHERE COALESCE(status, 'new') IN ('new', 'work', 'nocall') GROUP BY 1"
+            f" WHERE COALESCE(status, 'new') IN ('new', {_marks(OPEN_STATUSES)}) GROUP BY 1",
+            OPEN_STATUSES,
         ).fetchall())
 
 
@@ -497,9 +520,10 @@ def parked_leads(mod_id: int) -> list[dict]:
     with closing(connect()) as db:
         db.row_factory = sqlite3.Row
         rows = db.execute(
-            "SELECT id, name, callback_at, attempts, tz_offset FROM applications"
-            " WHERE status = 'nocall' AND assigned_to = ? ORDER BY callback_at, id",
-            (mod_id,),
+            "SELECT id, name, status, callback_at, attempts, tz_offset FROM applications"
+            f" WHERE status IN ({_marks(PARKED_STATUSES)}) AND assigned_to = ?"
+            " ORDER BY callback_at IS NULL, callback_at, id",
+            (*PARKED_STATUSES, mod_id),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -523,9 +547,9 @@ def take_lead(mod_id: int, mod_name: str, now: datetime | None = None) -> tuple[
         best = min(rows, key=lambda r: (lead_priority(r["tz_offset"], r["call_time"], now), r["id"]))
         db.execute(
             "UPDATE applications SET status = 'work', assigned_to = ?, assigned_name = ?,"
-            " taken_at = CURRENT_TIMESTAMP, warned = 0, callback_at = NULL, status_by = ?,"
-            " status_by_id = ?, status_at = CURRENT_TIMESTAMP, remind_count = 0, reminded_at = NULL"
-            " WHERE id = ? AND status = 'new'",
+            " taken_at = CURRENT_TIMESTAMP, assigned_at = CURRENT_TIMESTAMP, warned = 0,"
+            " callback_at = NULL, status_by = ?, status_by_id = ?, status_at = CURRENT_TIMESTAMP,"
+            " remind_count = 0, reminded_at = NULL WHERE id = ? AND status = 'new'",
             (mod_id, mod_name, mod_name, mod_id, best["id"]),
         )
         _log(db, best["id"], "work", mod_id, mod_name, "take", mod_id)
@@ -540,8 +564,9 @@ def take_callback(mod_id: int, mod_name: str, app_id: int) -> str:
         ).fetchone():
             return "busy"
         row = db.execute(
-            "SELECT 1 FROM applications WHERE id = ? AND status = 'nocall' AND assigned_to = ?",
-            (app_id, mod_id),
+            f"SELECT 1 FROM applications WHERE id = ? AND status IN ({_marks(PARKED_STATUSES)})"
+            " AND assigned_to = ?",
+            (app_id, *PARKED_STATUSES, mod_id),
         ).fetchone()
         if not row:
             return "gone"
@@ -624,7 +649,7 @@ def postpone_lead(app_id: int, mod_id: int, mod_name: str, option: str,
 def _requeue(db, app_id: int, by_id: int, by_name: str, kind: str, holder_id: int | None) -> None:
     db.execute(
         "UPDATE applications SET status = 'new', assigned_to = NULL, assigned_name = NULL,"
-        " taken_at = NULL, callback_at = NULL, warned = 0, cb_notified = 0,"
+        " taken_at = NULL, callback_at = NULL, warned = 0, cb_notified = 0, assigned_at = NULL,"
         " queued_at = CURRENT_TIMESTAMP, remind_count = 0, reminded_at = NULL,"
         " status_by = ?, status_by_id = ?, status_at = CURRENT_TIMESTAMP WHERE id = ?",
         (by_name, by_id, app_id),
@@ -635,7 +660,7 @@ def _requeue(db, app_id: int, by_id: int, by_name: str, kind: str, holder_id: in
 def release_lead(app_id: int, mod_id: int, mod_name: str, reason: str) -> bool:
     """Модератор сам возвращает заявку в очередь (причина обязательна)."""
     with closing(connect()) as db, db:
-        if not _owned(db, app_id, mod_id, ("work", "nocall")):
+        if not _owned(db, app_id, mod_id, OPEN_STATUSES):
             return False
         _requeue(db, app_id, mod_id, mod_name, "release", mod_id)
         db.execute(
@@ -696,7 +721,7 @@ def due_callbacks(now: datetime | None = None) -> list[tuple[int, int]]:
     with closing(connect()) as db:
         return db.execute(
             "SELECT id, assigned_to FROM applications"
-            " WHERE status = 'nocall' AND cb_notified = 0 AND callback_at <= ?",
+            " WHERE status IN ('nocall', 'callback') AND cb_notified = 0 AND callback_at <= ?",
             (utc_str(now),),
         ).fetchall()
 
@@ -711,7 +736,8 @@ def overdue_callbacks(now: datetime | None = None) -> list[tuple[int, int]]:
     limit = utc_str((now or utc_now()) - timedelta(hours=config.CALLBACK_RETURN_HOURS))
     with closing(connect()) as db:
         return db.execute(
-            "SELECT id, assigned_to FROM applications WHERE status = 'nocall' AND callback_at <= ?",
+            "SELECT id, assigned_to FROM applications"
+            " WHERE status IN ('nocall', 'callback') AND callback_at <= ?",
             (limit,),
         ).fetchall()
 
@@ -722,7 +748,7 @@ def system_requeue(app_id: int, kind: str, holder_id: int | None) -> bool:
         row = db.execute(
             "SELECT status FROM applications WHERE id = ?", (app_id,)
         ).fetchone()
-        if not row or row[0] not in ("work", "nocall"):
+        if not row or row[0] not in OPEN_STATUSES:
             return False
         _requeue(db, app_id, 0, "Система", kind, holder_id)
     return True
@@ -861,8 +887,10 @@ def moderator_stats() -> list[dict]:
             "SELECT id, assigned_to FROM applications WHERE status = 'work' AND assigned_to IS NOT NULL")}
         parked: dict[int, int] = {}
         for r in db.execute(
-            "SELECT assigned_to, COUNT(*) AS n FROM applications WHERE status = 'nocall'"
-            " AND assigned_to IS NOT NULL GROUP BY assigned_to"
+            "SELECT assigned_to, COUNT(*) AS n FROM applications"
+            f" WHERE status IN ({_marks(PARKED_STATUSES)}) AND assigned_to IS NOT NULL"
+            " GROUP BY assigned_to",
+            PARKED_STATUSES,
         ):
             parked[r["assigned_to"]] = r["n"]
     stats: dict[int, dict] = {}
@@ -910,11 +938,11 @@ def moderator_stats() -> list[dict]:
 # ---------- Excel ----------
 
 EXPORT_COLUMNS = [
-    ("#", 5), ("Дата и время", 17), ("Имя", 16), ("Телефон", 16), ("Telegram", 14),
+    ("#", 5), ("Дата и время", 17), ("Дата передачи", 17), ("Имя", 16), ("Телефон", 16), ("Telegram", 14),
     ("MAX", 14), ("WhatsApp", 14), ("Пол", 10), ("Мед. образование", 16), ("Возраст", 9),
     ("Город", 16), ("Часовой пояс", 18), ("Подразделение", 20), ("Служба ранее", 18),
     ("Удобное время", 30), ("Комментарий клиента", 30), ("Источник", 14), ("Статус", 16),
-    ("Модератор", 16), ("Недозвонов", 11), ("Статус изменён", 17), ("Заметки", 40),
+    ("Модератор", 16), ("Недозвонов", 11), ("Статус изменён", 17), ("Заметки", 40), ("Доп. информация", 40),
     ("Профиль", 20), ("Username", 14), ("User ID", 12),
 ]
 
@@ -941,14 +969,15 @@ def build_export_xlsx(filters: dict | None = None, scope_mod: int | None = None)
     for a in apps:
         status = a["status"] or "new"
         ws.append([safe_cell(v) for v in [
-            a["id"], fmt_ts(a["created_at"], "%d.%m.%Y %H:%M"), a["name"], a["phone"],
+            a["id"], fmt_ts(a["created_at"], "%d.%m.%Y %H:%M"),
+            fmt_ts(a["assigned_at"], "%d.%m.%Y %H:%M") if a["assigned_at"] else "", a["name"], a["phone"],
             a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["medical"], a["age"],
             a["city"], tz_text(a["tz_offset"]), a["unit"], a["served"],
             call_time_display(a["call_time"], a["tz_offset"]), a["comment"],
             names.get(a["source"], a["source"]), STATUSES.get(status, STATUSES["new"])[1],
             a["assigned_name"], a["attempts"] or 0,
             fmt_ts(a["status_at"], "%d.%m.%Y %H:%M") if a["status_at"] else "",
-            "\n".join(notes.get(a["id"], [])),
+            "\n".join(notes.get(a["id"], [])), a["extra"],
             a["full_name"], f"@{a['username']}" if a["username"] else "", a["user_id"],
         ]])
     for i, (_, width) in enumerate(EXPORT_COLUMNS, start=1):
@@ -1144,3 +1173,197 @@ def reminder_stats() -> dict:
         "enabled": reminders_enabled(), "by_stage": by_stage, "total": sum(by_stage.values()),
         "reminded": reminded, "converted": converted, "optout": optout,
     }
+
+
+
+# ---------- таблица модератора: статусы, пометки, правки данных ----------
+
+def _edit_log(db, app_id: int, by_id: int, by_name: str, field: str, old, new) -> None:
+    db.execute(
+        "INSERT INTO lead_edits (app_id, by_id, by_name, field, old, new) VALUES (?, ?, ?, ?, ?, ?)",
+        (app_id, by_id, by_name, field, None if old is None else str(old), None if new is None else str(new)),
+    )
+
+
+def get_edits(app_id: int) -> list[dict]:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT by_name, field, old, new, created_at FROM lead_edits WHERE app_id = ? ORDER BY id",
+            (app_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def change_status(app_id: int, mod_id: int, mod_name: str, new_status: str,
+                  note: str | None = None, callback_dt: datetime | None = None) -> dict | None:
+    """Модератор меняет статус своей заявки в таблице (из любого статуса, кроме «Новая»).
+    Для «Не дозвонились» и «Перезвонить» нужно время перезвона (callback_dt).
+    None — заявка не за этим модератором или нет времени перезвона."""
+    assert new_status in CHANGEABLE_STATUSES
+    with closing(connect()) as db, db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT status, assigned_to, attempts FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if not row or row["assigned_to"] != mod_id or row["status"] not in OPEN_STATUSES + FINAL_STATUSES:
+            return None
+        when = None
+        if new_status in ("nocall", "callback"):
+            if callback_dt is None:
+                return None
+            when = utc_str(callback_dt)
+        attempts = (row["attempts"] or 0) + (1 if new_status == "nocall" else 0)
+        db.execute(
+            "UPDATE applications SET status = ?, status_by = ?, status_by_id = ?,"
+            " status_at = CURRENT_TIMESTAMP, taken_at = NULL, warned = 0, callback_at = ?,"
+            " cb_notified = 0, attempts = ? WHERE id = ?",
+            (new_status, mod_name, mod_id, when, attempts, app_id),
+        )
+        kind = "final" if new_status in FINAL_STATUSES else new_status
+        _log(db, app_id, new_status, mod_id, mod_name, kind, mod_id)
+        if note:
+            db.execute(
+                "INSERT INTO lead_notes (app_id, by_id, by_name, text) VALUES (?, ?, ?, ?)",
+                (app_id, mod_id, mod_name, note),
+            )
+    return {"callback_at": when, "attempts": attempts, "old": row["status"]}
+
+
+def set_extra(app_id: int, mod_id: int, mod_name: str, text: str, mode: str) -> str | None:
+    """Доп. информация: mode = add (дописать строкой) | set (заменить) | clear.
+    Возвращает новый текст или None, если заявка не за этим модератором."""
+    with closing(connect()) as db, db:
+        row = db.execute(
+            "SELECT extra, assigned_to, COALESCE(status, 'new') FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if not row or row[1] != mod_id or row[2] == "new":
+            return None
+        old = row[0] or ""
+        new = "" if mode == "clear" else (text if mode == "set" or not old else f"{old}\n{text}")
+        new = new[:1000]
+        db.execute("UPDATE applications SET extra = ? WHERE id = ?", (new or None, app_id))
+        _edit_log(db, app_id, mod_id, mod_name, "Доп. информация", old or None, new or None)
+    return new
+
+
+def update_field(app_id: int, mod_id: int, mod_name: str, key: str, value) -> bool:
+    """Модератор правит данные клиента. value — уже проверенное значение (для tz — название пояса)."""
+    label, column = EDIT_FIELDS[key]
+    with closing(connect()) as db, db:
+        row = db.execute(
+            f"SELECT {column}, assigned_to, COALESCE(status, 'new') FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if not row or row[1] != mod_id or row[2] == "new":
+            return False
+        old = row[0]
+        if key == "tz":
+            new = TZ_BY_LABEL[value]
+            old_show, new_show = TZ_LABEL_BY_OFFSET.get(old, old), value
+        else:
+            new = int(value) if key == "age" else value
+            old_show, new_show = old, new
+        db.execute(f"UPDATE applications SET {column} = ? WHERE id = ?", (new, app_id))
+        _edit_log(db, app_id, mod_id, mod_name, label, old_show, new_show)
+    return True
+
+
+def update_last_note(app_id: int, by_id: int, text: str) -> bool:
+    with closing(connect()) as db, db:
+        row = db.execute(
+            "SELECT id, text, by_name FROM lead_notes WHERE app_id = ? AND by_id = ? ORDER BY id DESC LIMIT 1",
+            (app_id, by_id),
+        ).fetchone()
+        if not row:
+            return False
+        db.execute("UPDATE lead_notes SET text = ? WHERE id = ?", (text, row[0]))
+        _edit_log(db, app_id, by_id, row[2], "Комментарий", row[1], text)
+    return True
+
+
+def delete_last_note(app_id: int, by_id: int) -> str | None:
+    with closing(connect()) as db, db:
+        row = db.execute(
+            "SELECT id, text, by_name FROM lead_notes WHERE app_id = ? AND by_id = ? ORDER BY id DESC LIMIT 1",
+            (app_id, by_id),
+        ).fetchone()
+        if not row:
+            return None
+        db.execute("DELETE FROM lead_notes WHERE id = ?", (row[0],))
+        _edit_log(db, app_id, by_id, row[2], "Комментарий", row[1], None)
+    return row[1]
+
+
+TABLE_FILTERS = {
+    "all": ("", ()),
+    "open": (f" AND status IN ({_marks(OPEN_STATUSES)})", OPEN_STATUSES),
+    "cb": (" AND status IN ('nocall', 'callback')", ()),
+    "final": (f" AND status IN ({_marks(FINAL_STATUSES)})", FINAL_STATUSES),
+}
+
+
+def _table_ids(db, mod_id: int, flt: str) -> list[int]:
+    cond, args = TABLE_FILTERS[flt]
+    order = ("callback_at IS NULL, callback_at, id" if flt == "cb" else
+             "(status = 'work') DESC, COALESCE(assigned_at, status_at, created_at) DESC, id DESC")
+    return [r[0] for r in db.execute(
+        f"SELECT id FROM applications WHERE assigned_to = ?{cond} ORDER BY {order}", (mod_id, *args)
+    )]
+
+
+def table_counts(mod_id: int) -> dict[str, int]:
+    with closing(connect()) as db:
+        return {f: len(_table_ids(db, mod_id, f)) for f in TABLE_FILTERS}
+
+
+def table_page(mod_id: int, flt: str, page: int, per_page: int = PER_PAGE) -> tuple[int, int, list[dict]]:
+    """Страница таблицы модератора: (всего, номер страницы, заявки целиком с комментариями)."""
+    with closing(connect()) as db:
+        ids = _table_ids(db, mod_id, flt)
+    total = len(ids)
+    pages = max(1, -(-total // per_page))
+    page = min(max(page, 0), pages - 1)
+    return total, page, [get_application(i) for i in ids[page * per_page:(page + 1) * per_page]]
+
+
+TABLE_COLUMNS = [
+    ("№", 6), ("Дата передачи", 16), ("Анкета", 46), ("Статус", 18),
+    ("Комментарий модератора", 46), ("Перезвонить", 16), ("Доп. информация", 40),
+]
+
+
+def status_label(app: dict) -> str:
+    label = STATUSES.get(app["status"], STATUSES["new"])[1]
+    return f"{label} (попытка {app['attempts']})" if app["status"] == "nocall" and app.get("attempts") else label
+
+
+def build_table_xlsx(mod_id: int) -> BytesIO:
+    """«Моя таблица» модератора: дата передачи, анкета, статус, комментарий, перезвон, доп. информация."""
+    from openpyxl.styles import Alignment
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Моя таблица"
+    ws.append([name for name, _ in TABLE_COLUMNS])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    with closing(connect()) as db:
+        ids = _table_ids(db, mod_id, "all")
+    for app_id in ids:
+        a = get_application(app_id)
+        comments = "\n".join(f"{fmt_ts(n['created_at'])} {n['text']}" for n in a["notes"])
+        ws.append([safe_cell(v) for v in [
+            a["id"], fmt_ts(a["assigned_at"] or a["status_at"] or a["created_at"], "%d.%m.%Y %H:%M"),
+            "\n".join(anketa_lines(a)), status_label(a), comments,
+            fmt_ts(a["callback_at"], "%d.%m.%Y %H:%M") if a["callback_at"] else "", a["extra"],
+        ]])
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    for i, (_, width) in enumerate(TABLE_COLUMNS, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf

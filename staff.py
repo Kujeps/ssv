@@ -24,14 +24,14 @@ from aiogram.types import (
 )
 
 from config import (
-    ADMIN_USER_IDS, CALLBACK_OPTIONS, LOCAL_TZ, NOCALL_ALERT_ATTEMPTS, REMINDER_DELAYS_HOURS,
-    REMINDER_WINDOW_MSK,
+    ADMIN_USER_IDS, CALLBACK_OPTIONS, LOCAL_TZ, NOCALL_ALERT_ATTEMPTS, OPEN_STATUSES,
+    REMINDER_DELAYS_HOURS, REMINDER_WINDOW_MSK,
     PER_PAGE, REASON_REQUIRED, STATUSES,
 )
 from db import (
     active_lead, add_moderator, add_note, admin_requeue, archive_moderators, archive_page,
     build_export_xlsx, create_source, finish_lead, get_application, get_broadcast_recipients,
-    get_history, get_stats, list_moderators, list_sources, mark_blocked,
+    get_edits, get_history, get_stats, list_moderators, list_sources, mark_blocked,
     moderator_stats, parked_leads, postpone_lead, release_lead, remove_moderator,
     save_lead_message, set_setting, source_label, source_name_taken, source_names, take_callback,
     take_lead, used_sources, build_users_xlsx, reminder_stats, reminders_enabled, users_counts,
@@ -159,13 +159,14 @@ async def on_callbacks_list(cb: CallbackQuery) -> None:
     rows = []
     for p in parked[:10]:
         due = p["callback_at"] and p["callback_at"] <= now
-        label = (f"{'⏰ ' if due else ''}#{p['id']} · {(p['name'] or 'без имени')[:16]}"
-                 f" · {fmt_ts(p['callback_at'], '%d.%m %H:%M')} МСК")
+        when = f" · {fmt_ts(p['callback_at'], '%d.%m %H:%M')}" if p["callback_at"] else ""
+        label = (f"{'⏰ ' if due else ''}{STATUSES[p['status']][0]} #{p['id']} · "
+                 f"{(p['name'] or 'без имени')[:16]}{when}")
         rows.append([btn(label, f"mt:{p['id']}")])
-    rows.append([btn("🏠 Меню", "mp:menu")])
+    rows.append([btn("📋 Моя таблица", "tb:open"), btn("🏠 Меню", "mp:menu")])
     await cb.message.answer(
-        "🔁 <b>Перезвонить позже</b>\n\nНажмите на заявку, чтобы позвонить ещё раз. "
-        "⏰ — время перезвона уже наступило.",
+        "🔁 <b>В ожидании</b>\n\nНажмите на заявку, чтобы позвонить ещё раз. "
+        "⏰ — время перезвона уже наступило. Пометки и данные клиента — в «Моей таблице».",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -200,7 +201,7 @@ MOD_CANCEL = InlineKeyboardMarkup(inline_keyboard=[[btn("↩️ Отмена", "
 
 
 def owned_by(app: dict | None, user_id: int) -> bool:
-    return bool(app and app["assigned_to"] == user_id and app["status"] in ("work", "nocall"))
+    return bool(app and app["assigned_to"] == user_id and app["status"] in OPEN_STATUSES)
 
 
 @staff.callback_query(F.data.startswith("mv:"), IsModerator())
@@ -520,7 +521,8 @@ async def on_mod_add(cb: CallbackQuery, state: FSMContext) -> None:
 async def set_moderator_commands(bot: Bot, user_id: int) -> None:
     with suppress(TelegramBadRequest, TelegramForbiddenError):
         await bot.set_my_commands(
-            [BotCommand(command="start", description="Панель модератора")],
+            [BotCommand(command="start", description="Панель модератора"),
+             BotCommand(command="table", description="Моя таблица")],
             scope=BotCommandScopeChat(chat_id=user_id),
         )
 
@@ -617,7 +619,7 @@ async def on_mod_del_ok(cb: CallbackQuery, bot: Bot) -> None:
 
 STATUS_FILTERS = [
     ("all", "Все"), ("new", "🆕 Новые"), ("work", "🔧 В работе"), ("nocall", "📵 Не дозвонились"),
-    ("agreed", "✅ Согласился"), ("refused", "❌ Отказался"), ("junk", "🗑 Мусор"),
+    ("reached", "📞 Дозвонились"), ("callback", "🔁 Перезвонить"), ("agreed", "✅ Согласился"), ("refused", "❌ Отказался"), ("junk", "🗑 Мусор"),
 ]
 PERIOD_FILTERS = [
     ("all", "Всё время"), ("today", "Сегодня"), ("yesterday", "Вчера"),
@@ -625,6 +627,7 @@ PERIOD_FILTERS = [
 ]
 HISTORY_LABELS = {
     "take": "взял в работу", "take_cb": "взял на перезвон", "nocall": "не дозвонился",
+    "reached": "дозвонился", "callback": "назначил перезвон",
     "release": "вернул в очередь", "timeout": "автовозврат: время вышло",
     "cb_timeout": "автовозврат: перезвон просрочен", "admin": "вернул админ",
     "remove_mod": "модератор убран → в очередь", "migrate": "перенесена в очередь",
@@ -844,12 +847,22 @@ async def on_archive_export(cb: CallbackQuery, state: FSMContext, bot: Bot) -> N
 
 
 def history_text(app_id: int) -> str:
-    lines = []
-    for h in get_history(app_id)[-12:]:
+    events = []
+    for h in get_history(app_id):
         kind = h["kind"]
         action = (STATUSES[h["status"]][1] if kind == "final" else HISTORY_LABELS.get(kind, h["status"]))
-        lines.append(f"{fmt_ts(h['created_at'])} — {escape(h['by_name'] or '—')}: {action}")
+        events.append((h["created_at"], f"{escape(h['by_name'] or '—')}: {action}"))
+    for e in get_edits(app_id):
+        old, new = escape(short_text(e["old"])), escape(short_text(e["new"]))
+        events.append((e["created_at"], f"{escape(e['by_name'] or '—')}: {escape(e['field'])} — {old} → {new}"))
+    events.sort(key=lambda x: x[0])
+    lines = [f"{fmt_ts(ts)} — {text}" for ts, text in events[-15:]]
     return ("\n\n🕘 <b>История:</b>\n" + "\n".join(lines)) if lines else ""
+
+
+def short_text(value: str | None, limit: int = 40) -> str:
+    value = " ".join((value or "—").split())
+    return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
 @staff.callback_query(F.data.startswith("ar:o:"), IsStaff())
@@ -868,6 +881,8 @@ async def on_archive_open_card(cb: CallbackQuery, state: FSMContext) -> None:
     markup = lead_keyboard(app, "admin") if admin else None
     if markup:
         rows += markup.inline_keyboard
+    if not admin and app["assigned_to"] == cb.from_user.id and app["status"] != "new":
+        rows.append([btn("✏️ Изменить", f"tb:n:{app['id']}")])
     rows.append([btn("⬅️ К списку", "ar:b")])
     with suppress(TelegramBadRequest):
         await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))

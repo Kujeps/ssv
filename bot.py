@@ -19,12 +19,20 @@ from config import ADMIN_USER_IDS, BOT_TOKEN, DB_PATH
 from db import init_db, moderator_ids
 from jobs import maintenance_loop
 from staff import staff
+from table import table
 
 bot_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-# Порядок важен: сначала персонал (админ, модераторы), затем клиенты.
+# Порядок важен: сначала таблица модератора и персонал (админ, модераторы), затем клиенты.
+dp.include_router(table)
 dp.include_router(staff)
 dp.include_router(client)
+
+
+MODERATOR_COMMANDS = [
+    BotCommand(command="start", description="Панель модератора"),
+    BotCommand(command="table", description="Моя таблица"),
+]
 
 
 async def setup_commands(bot: Bot) -> None:
@@ -48,10 +56,7 @@ async def setup_commands(bot: Bot) -> None:
         if mod_id in ADMIN_USER_IDS:
             continue
         with suppress(TelegramBadRequest, TelegramForbiddenError):
-            await bot.set_my_commands(
-                [BotCommand(command="start", description="Панель модератора")],
-                scope=BotCommandScopeChat(chat_id=mod_id),
-            )
+            await bot.set_my_commands(MODERATOR_COMMANDS, scope=BotCommandScopeChat(chat_id=mod_id))
 
 
 async def main() -> None:
