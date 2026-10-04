@@ -31,7 +31,7 @@ async def main():
     w.clear(); await w.msg(50, "/table"); t = w.last_to(50)
     assert "Моя таблица</b> · Все: 4" in t["text"], t["text"]; ok("/table: таблица модератора, всего 4 своих заявки")
     assert f"#{foreign}" not in t["text"]; ok("чужие заявки в таблице не показываются")
-    for part in ("#%d" % work_id, "В работе", "Клиент", "+7900000000", "@c10", "Самара (МСК+1)", "ВДВ", "Звонить: Вечер", "МСК"):
+    for part in ("#%d" % work_id, "Взята", "Клиент", "+7900000000", "@c10", "Самара (МСК+1)", "ВДВ", "Звонить: Вечер", "МСК"):
         assert part in t["text"] or part.startswith("@c10"), (part, t["text"])
     ok("строка таблицы: №, дата, статус, анкета (контакты, город и пояс, подразделение, окно звонка в МСК)")
     assert "tb:e:%d" % work_id in w.datas(t["kb"]) and "tb:xl" in w.datas(t["kb"]); ok("кнопка на каждую заявку и «Excel»")
@@ -43,7 +43,7 @@ async def main():
     # --- вкладки ---
     scr = w.with_kb(50)
     await w.press(50, "tb:v:final:0", mid=scr); e = w.edits[-1]
-    assert "Закрытые: 3" in e["text"] and "В работе" not in e["text"].split("\n\n", 1)[1]; ok("вкладка «Закрытые»: 3 заявки")
+    assert "Закрытые: 3" in e["text"] and "Взята" not in e["text"].split("\n\n", 1)[1]; ok("вкладка «Закрытые»: 3 заявки")
     await w.press(50, "tb:v:cb:0", mid=scr); assert "Перезвонить: 0" in w.edits[-1]["text"] and "Здесь пока пусто" in w.edits[-1]["text"]; ok("вкладка «Перезвонить» пока пустая")
 
     # --- экран редактирования ---

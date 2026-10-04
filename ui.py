@@ -186,7 +186,10 @@ def lead_text(app: dict, view: str = "admin", viewer_id: int | None = None) -> s
     elif status == "callback":
         lines.append(f"🔁 Перезвонить: <b>{fmt_ts(app['callback_at'])}</b> МСК")
     elif status == "reached":
-        lines.append(f"📞 <b>Дозвонились</b> — {escape(app['status_by'] or '—')} · {fmt_ts(app['status_at'])}")
+        lines.append(
+            f"⏳ <b>В работе</b> — {escape(app['status_by'] or '—')} · {fmt_ts(app['status_at'])} "
+            "(без таймера: ждём решения клиента)"
+        )
     elif status in ("agreed", "refused", "junk"):
         lines.append(f"{icon} <b>{label}</b> — {escape(app['status_by'] or '—')} · {fmt_ts(app['status_at'])}")
     elif (app["attempts"] or 0) > 0:
@@ -214,11 +217,11 @@ def lead_keyboard(app: dict, view: str = "admin", viewer_id: int | None = None):
     if status == "work":
         return InlineKeyboardMarkup(inline_keyboard=[
             [btn("✅ Согласился", f"mv:{app_id}:agreed"), btn("❌ Отказался", f"mv:{app_id}:refused")],
-            [btn("📵 Не дозвонился", f"mv:{app_id}:nocall"), btn("🗑 Мусор", f"mv:{app_id}:junk")],
-            [btn("✍️ Заметка", f"mv:{app_id}:note"), btn("✏️ Изменить", f"tb:n:{app_id}")],
-            [btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
+            [btn("⏳ В работе", f"mv:{app_id}:reached"), btn("📵 Не дозвонился", f"mv:{app_id}:nocall")],
+            [btn("🗑 Мусор", f"mv:{app_id}:junk"), btn("✍️ Заметка", f"mv:{app_id}:note")],
+            [btn("✏️ Изменить", f"tb:n:{app_id}"), btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
         ])
-    if status in OPEN_STATUSES:  # в ожидании: «Не дозвонились» / «Дозвонились» / «Перезвонить»
+    if status in OPEN_STATUSES:  # в ожидании: «В работе» / «Не дозвонились» / «Перезвонить»
         return InlineKeyboardMarkup(inline_keyboard=[
             [btn("📞 Позвонить сейчас", f"mt:{app_id}")],
             [btn("✏️ Изменить", f"tb:n:{app_id}"), btn("✍️ Заметка", f"mv:{app_id}:note")],
@@ -246,11 +249,11 @@ def mod_panel(mod_id: int) -> tuple[str, InlineKeyboardMarkup]:
     ]
     if active:
         lines.append(
-            f"🔧 У вас в работе: заявка #{active['id']} (осталось {fmt_wait(minutes_left(active))})"
+            f"🔧 Взята вами: заявка #{active['id']} (осталось {fmt_wait(minutes_left(active))})"
         )
     if parked:
         lines.append(
-            f"🔁 В ожидании (перезвонить, дозвонились): <b>{len(parked)}</b>"
+            f"⏳ У вас в работе и в ожидании: <b>{len(parked)}</b>"
             + (f" · пора звонить: {due}" if due else "")
         )
     rows = [[btn(f"📂 Моя заявка #{active['id']}", "mp:active")] if active
@@ -265,8 +268,9 @@ def admin_panel(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
     lines = [
         "🛠 <b>Панель администратора</b>",
         "",
-        f"📥 В очереди: <b>{summary.get('new', 0)}</b> · 🔧 В работе: <b>{summary.get('work', 0)}</b>"
-        f" · 🔁 В ожидании: <b>{sum(summary.get(k, 0) for k in ('nocall', 'callback', 'reached'))}</b>",
+        f"📥 В очереди: <b>{summary.get('new', 0)}</b> · 🔧 Взято: <b>{summary.get('work', 0)}</b>"
+        f" · ⏳ В работе: <b>{summary.get('reached', 0)}</b>"
+        f" · 🔁 Перезвонить: <b>{summary.get('nocall', 0) + summary.get('callback', 0)}</b>",
         f"👥 Модераторов: <b>{len(list_moderators())}</b>",
     ]
     rows = [

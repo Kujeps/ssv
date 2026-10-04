@@ -30,7 +30,7 @@ from config import (
 )
 from db import (
     active_lead, add_moderator, add_note, admin_requeue, archive_moderators, archive_page,
-    build_export_xlsx, create_source, finish_lead, get_application, get_broadcast_recipients,
+    build_export_xlsx, change_status, create_source, finish_lead, get_application, get_broadcast_recipients,
     get_edits, get_history, get_stats, list_moderators, list_sources, mark_blocked,
     moderator_stats, parked_leads, postpone_lead, release_lead, remove_moderator,
     save_lead_message, set_setting, source_label, source_name_taken, source_names, take_callback,
@@ -142,7 +142,7 @@ async def on_take(cb: CallbackQuery, bot: Bot) -> None:
 async def on_active(cb: CallbackQuery, bot: Bot) -> None:
     app = active_lead(cb.from_user.id)
     if not app:
-        await cb.answer("У вас нет заявки в работе", show_alert=True)
+        await cb.answer("У вас нет взятой заявки", show_alert=True)
         return
     await cb.answer()
     await send_card(bot, cb.message.chat.id, app["id"])
@@ -220,6 +220,17 @@ async def on_mod_action(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await cb.answer("✅ Согласился")
         await refresh_cards(bot, app_id)
         await next_prompt(bot, cb.message.chat.id, f"✅ Заявка #{app_id} закрыта: <b>Согласился</b>.")
+    elif act == "reached":
+        if change_status(app_id, user.id, user.full_name, "reached") is None:
+            await cb.answer("Эта заявка уже не закреплена за вами", show_alert=True)
+            return
+        await cb.answer("⏳ В работе")
+        await refresh_cards(bot, app_id)
+        await next_prompt(
+            bot, cb.message.chat.id,
+            f"⏳ Заявка #{app_id} <b>в работе</b>: она остаётся у вас без таймера — ведите её в "
+            "«Моей таблице». Можно взять следующую.",
+        )
     elif act == "nocall":
         await cb.answer()
         rows = [[btn(label, f"mc:{app_id}:{key}")] for key, label in CALLBACK_OPTIONS.items()]
@@ -470,7 +481,7 @@ def moderators_view() -> tuple[str, InlineKeyboardMarkup]:
         e = stats.get(m["user_id"], {})
         info = []
         if e.get("active"):
-            info.append(f"🔧 в работе #{e['active']}")
+            info.append(f"🔧 взята #{e['active']}")
         if e.get("parked"):
             info.append(f"🔁 перезвонить: {e['parked']}")
         lines += ["", f"• {moderator_title(m)} · ID <code>{m['user_id']}</code>" + (" · " + " · ".join(info) if info else "")]
@@ -586,7 +597,7 @@ async def on_mod_del(cb: CallbackQuery) -> None:
     open_leads = (1 if e.get("active") else 0) + e.get("parked", 0)
     await cb.message.answer(
         f"Убрать модератора <b>{moderator_title(mod)}</b>?\n\n"
-        f"Его заявки в работе и «Перезвонить» (<b>{open_leads}</b>) вернутся в очередь. "
+        f"Его заявки «Взята», «В работе» и «Перезвонить» (<b>{open_leads}</b>) вернутся в очередь. "
         "Обработанные заявки останутся в архиве.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [btn("✅ Убрать", f"md:ok:{user_id}")], [btn("↩️ Отмена", "ap:mods")],
@@ -618,8 +629,8 @@ async def on_mod_del_ok(cb: CallbackQuery, bot: Bot) -> None:
 # ---------- архив заявок: фильтры, поиск, карточка ----------
 
 STATUS_FILTERS = [
-    ("all", "Все"), ("new", "🆕 Новые"), ("work", "🔧 В работе"), ("nocall", "📵 Не дозвонились"),
-    ("reached", "📞 Дозвонились"), ("callback", "🔁 Перезвонить"), ("agreed", "✅ Согласился"), ("refused", "❌ Отказался"), ("junk", "🗑 Мусор"),
+    ("all", "Все"), ("new", "🆕 Новые"), ("work", "🔧 Взята"), ("reached", "⏳ В работе"),
+    ("nocall", "📵 Не дозвонились"), ("callback", "🔁 Перезвонить"), ("agreed", "✅ Согласился"), ("refused", "❌ Отказался"), ("junk", "🗑 Мусор"),
 ]
 PERIOD_FILTERS = [
     ("all", "Всё время"), ("today", "Сегодня"), ("yesterday", "Вчера"),
@@ -627,7 +638,7 @@ PERIOD_FILTERS = [
 ]
 HISTORY_LABELS = {
     "take": "взял в работу", "take_cb": "взял на перезвон", "nocall": "не дозвонился",
-    "reached": "дозвонился", "callback": "назначил перезвон",
+    "reached": "поставил «В работе»", "callback": "назначил перезвон",
     "release": "вернул в очередь", "timeout": "автовозврат: время вышло",
     "cb_timeout": "автовозврат: перезвон просрочен", "admin": "вернул админ",
     "remove_mod": "модератор убран → в очередь", "migrate": "перенесена в очередь",

@@ -29,8 +29,8 @@ async def main():
     for part in ("Заявка #%d" % a1, "+79990000001", "01:00 на обработку", "будет возвращена в список необработанных"):
         assert part in card["text"], (part, card["text"])
     ok("взял заявку: видит контакты и предупреждение «У вас есть 01:00 на обработку…»")
-    assert set(w.datas(card["kb"])) == {f"mv:{a1}:{x}" for x in ("agreed", "refused", "nocall", "junk", "note", "release")} | {f"tb:n:{a1}"}; ok("кнопки: согласился / отказался / недозвонился / мусор / заметка / вернуть / изменить")
-    t = admin_card_text(a1); assert "В работе" in t and "Иван" in t and "Взята" in t; ok("карточка админа обновилась: в работе у Ивана")
+    assert set(w.datas(card["kb"])) == {f"mv:{a1}:{x}" for x in ("agreed", "refused", "reached", "nocall", "junk", "note", "release")} | {f"tb:n:{a1}"}; ok("кнопки: согласился / отказался / в работе / недозвонился / мусор / заметка / вернуть / изменить")
+    t = admin_card_text(a1); assert "Взята" in t and "Иван" in t; ok("карточка админа обновилась: взята Иваном")
     # --- нельзя взять вторую ---
     w.clear(); await w.press(50, "mp:take")
     assert w.answers[-1][0] == "Сначала завершите текущую заявку" and f"Заявка #{a1}" in w.last_to(50)["text"]; ok("пока не закрыта, вторую не выдают (карточка показывается снова)")
