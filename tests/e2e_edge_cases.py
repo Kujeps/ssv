@@ -1,6 +1,6 @@
 import os, sys; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import h
-path = h.setup("n6")
+path = h.setup("n6", FORM_VARIANT="full")
 from h import ok, run
 
 async def main():

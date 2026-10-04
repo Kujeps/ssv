@@ -69,7 +69,7 @@ def row_block(app: dict) -> str:
     head = f"<b>#{app['id']}</b> · {when} · {icon} {escape(status_label(app))}"
     if app["callback_at"] and app["status"] in ("nocall", "callback"):
         head += f" · 🔁 {fmt_ts(app['callback_at'])}"
-    lines = [head] + [escape(x) for x in anketa_lines(app)]
+    lines = [head] + [escape(x) for x in anketa_lines(app, comment_limit=100)]
     if app["notes"]:
         lines.append("💬 " + escape(short(app["notes"][-1]["text"])))
     if app.get("extra"):

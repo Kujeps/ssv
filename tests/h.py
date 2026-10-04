@@ -14,7 +14,8 @@ def setup(name, admins="1", **env):
     path = f"{SP}/{name}.db"
     if os.path.exists(path):
         os.remove(path)
-    os.environ.update(BOT_TOKEN="123:TEST", ADMIN_USER_IDS=admins, DB_PATH=path, TZ_OFFSET_HOURS="3")
+    os.environ.update(BOT_TOKEN="123:TEST", ADMIN_USER_IDS=admins, DB_PATH=path, TZ_OFFSET_HOURS="3",
+                      TYPING_MAX_SECONDS="0")
     for k, v in env.items():
         os.environ[k] = str(v)
     sys.path.insert(0, PROJECT)
@@ -77,13 +78,16 @@ class World:
                 if name == "GetMe":
                     return method.__returning__.model_validate(
                         {"id": 8676218033, "is_bot": True, "first_name": "ZV", "username": "pobeda_skoro_bot"})
+                if name == "SendChatAction":
+                    world.actions.append((method.chat_id, str(method.action)))
+                    return True
                 if name in ("SetMyCommands", "DeleteMyCommands"):
                     world.commands.append((name, getattr(method, "scope", None)))
                     return True
                 return True
 
         self.sent, self.edits, self.markups, self.deleted = [], [], [], []
-        self.answers, self.docs, self.commands = [], [], []
+        self.answers, self.docs, self.commands, self.actions = [], [], [], []
         self.last, self.forbidden = {}, set()
         self.n = 0
         self.session = Fake()

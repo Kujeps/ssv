@@ -1,6 +1,6 @@
 import os, sys; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import h
-path = h.setup("rem")
+path = h.setup("rem", FORM_VARIANT="full")
 from h import ok, run
 import io, sqlite3
 from datetime import datetime, timedelta, timezone

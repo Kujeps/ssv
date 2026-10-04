@@ -9,16 +9,18 @@ from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove, User
 
+import config
 from config import CHOICES, GENDERS, REQUIRED_STEPS
 from db import (
-    active_application, had_started_before, log_start, save_application, set_reminders_off,
-    touch_funnel,
+    active_application, append_client_comment, had_started_before, log_start, save_application,
+    set_reminders_off, touch_funnel,
 )
 from form import (
     BTN_BACK, BTN_SKIP, CONTACT_KEYS, GREETING, LAST_CONTACT_STEP, NORMALIZERS, PROMPTS,
     ERRORS, STEP_STATES, Form, active_steps, card, header, norm_phone, parse_source,
 )
-from notify import notify_moderators_queue, send_lead_cards
+from notify import notify_moderators_queue, refresh_cards, send_lead_cards
+from quick import TEXTS as QUICK_TEXTS, begin_quick, say
 from reminders import OPTOUT_DONE
 from ui import (
     apply_keyboard, confirm_keyboard, pending_notice, phone_keyboard, step_keyboard,
@@ -123,6 +125,8 @@ async def on_start(
     await state.clear()
     if pending:
         await message.answer(pending_notice(pending))
+    elif config.FORM_VARIANT == "short":
+        await begin_quick(bot, message.chat.id, state)  # сразу короткий диалог
     else:
         await message.answer(GREETING, reply_markup=apply_keyboard())
 
@@ -143,9 +147,12 @@ async def on_apply(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
             await cb.message.edit_text(pending_notice(pending), reply_markup=None)
         return
     await cb.answer()
-    touch_funnel(cb.from_user, "started_form_at")
     with suppress(TelegramBadRequest):
         await cb.message.edit_reply_markup(reply_markup=None)
+    if config.FORM_VARIANT == "short":
+        await begin_quick(bot, cb.message.chat.id, state)
+        return
+    touch_funnel(cb.from_user, "started_form_at")
     await start_form(bot, cb.message.chat.id, state, cb.from_user)
 
 
@@ -290,9 +297,17 @@ async def on_step_other(message: Message) -> None:
 
 
 @client.message()
-async def on_anything(message: Message) -> None:
+async def on_anything(message: Message, bot: Bot) -> None:
     pending = active_application(message.from_user.id)
     if pending:
+        text = (message.text or "").strip()
+        if len(text) >= 3 and not text.startswith("/"):
+            # Заявка уже подана: всё, что человек пишет дальше, — его дополнение к заявке.
+            app_id = append_client_comment(message.from_user.id, text[:500])
+            if app_id:
+                await refresh_cards(bot, app_id)
+                await say(bot, message.chat.id, QUICK_TEXTS["extra_ack"])
+                return
         await message.answer(pending_notice(pending))
         return
     await message.answer(

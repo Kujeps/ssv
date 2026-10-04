@@ -251,3 +251,44 @@ def card(data: dict, skip_empty: bool = False) -> str:
         elif not skip_empty:
             lines.append(f"{icon} <b>{label}:</b> —")
     return "\n".join(lines)
+
+
+# ---------- короткий диалог: «27, Иркутск, мужчина» ----------
+
+GENDER_WORDS = {
+    "м": GENDERS[0], "муж": GENDERS[0], "мужской": GENDERS[0], "мужчина": GENDERS[0],
+    "парень": GENDERS[0], "юноша": GENDERS[0],
+    "ж": GENDERS[1], "жен": GENDERS[1], "женский": GENDERS[1], "женщина": GENDERS[1],
+    "девушка": GENDERS[1],
+}
+INTRO_FILLER = {
+    "мне", "лет", "года", "год", "я", "из", "в", "г", "город", "живу", "пол", "возраст", "и",
+    "меня", "мой", "моя", "родом", "проживаю", "из-за", "по",
+}
+
+
+def parse_intro(text: str) -> dict:
+    """Из свободного текста достаёт возраст, пол и город. Чего нет — None.
+    «27, Иркутск, мужчина», «Иркутск 27 муж», «мне 27 лет, живу в Омске, девушка»."""
+    text = re.sub(r"\bг\.\s*", " ", text, flags=re.I)
+    tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9.\-]*", text)
+    age = gender = None
+    rest = []
+    for tok in tokens:
+        low = tok.lower().strip(".")
+        m = re.fullmatch(r"(\d{1,3})(?:лет|года|год)?", low)
+        if m and age is None:
+            age = int(m.group(1))
+        elif low in GENDER_WORDS and gender is None:
+            gender = GENDER_WORDS[low]
+        elif low in INTRO_FILLER or re.fullmatch(r"\d+", low):
+            continue
+        else:
+            rest.append(tok)
+    city = " ".join(rest).strip(" .,-")
+    if city and city == city.lower():
+        city = "-".join(part.capitalize() for part in city.split("-")) if "-" in city and " " not in city \
+            else " ".join(w.capitalize() for w in city.split())
+    if not (2 <= len(city) <= 60 and re.search(r"[A-Za-zА-Яа-яЁё]", city)):
+        city = None
+    return {"age": age, "gender": gender, "city": city}

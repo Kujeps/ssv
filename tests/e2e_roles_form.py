@@ -1,6 +1,6 @@
 import os, sys; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import h
-path = h.setup("n1")
+path = h.setup("n1", FORM_VARIANT="full")
 from h import ok, run
 import sqlite3
 

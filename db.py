@@ -1367,3 +1367,18 @@ def build_table_xlsx(mod_id: int) -> BytesIO:
     wb.save(buf)
     buf.seek(0)
     return buf
+
+
+def append_client_comment(user_id: int, text: str) -> int | None:
+    """Клиент дописывает информацию о себе к своей действующей заявке. Возвращает номер заявки."""
+    with closing(connect()) as db, db:
+        row = db.execute(
+            f"SELECT id, comment FROM applications WHERE user_id = ?"
+            f" AND COALESCE(status, 'new') IN ({_marks(BLOCKING_STATUSES)}) ORDER BY id DESC LIMIT 1",
+            (user_id, *BLOCKING_STATUSES),
+        ).fetchone()
+        if not row:
+            return None
+        new = f"{row[1]}\n{text}" if row[1] else text
+        db.execute("UPDATE applications SET comment = ? WHERE id = ?", (new[:1500], row[0]))
+    return row[0]

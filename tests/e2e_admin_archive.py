@@ -138,7 +138,7 @@ async def main():
     assert not D.is_moderator(52) and D.get_application(open_id)["status"] == "new"; ok("модератор убран, его заявка в работе вернулась в очередь")
     assert D.get_application(2)["status"] == "refused" and D.get_application(2)["assigned_to"] == 52; ok("его обработанные заявки остались в архиве")
     assert any("Доступ модератора отозван" in (s["text"] or "") for s in w.to(52)) and any(c[0] == "DeleteMyCommands" for c in w.commands); ok("ему сообщено, меню команд сброшено")
-    w.clear(); await w.msg(52, "/start"); assert "оставьте заявку" in w.last_to(52)["text"]; ok("убранный модератор дальше — обычный клиент")
+    w.clear(); await w.msg(52, "/start"); assert any("помощник по приёму заявок" in (x["text"] or "") for x in w.to(52)); ok("убранный модератор дальше — обычный клиент (получает диалог заявки)")
 
     # ---------- статистика ----------
     w.clear(); await w.msg(1, "/stats"); st = w.last_to(1)["text"]

@@ -105,6 +105,8 @@ def lead_priority(tz_offset: int | None, call_time: str | None, now: datetime | 
     """Чем меньше число, тем раньше заявку нужно выдать модератору.
     0 — клиенту удобно говорить прямо сейчас, 1 — подходит любое время,
     2 — удобное окно сейчас закрыто, 3 — у клиента ночь."""
+    if tz_offset is None:
+        return 1  # пояс клиента неизвестен — считаем, что звонить можно в любое время
     hour = client_local(tz_offset, now).hour
     if hour >= NIGHT_FROM or hour < NIGHT_TO:
         return 3
@@ -122,8 +124,9 @@ def age_text(n: int) -> str:
     return f"{n} {'год' if n % 10 == 1 else 'года' if 2 <= n % 10 <= 4 else 'лет'}"
 
 
-def anketa_lines(app: dict) -> list[str]:
-    """Анкета клиента в виде коротких строк (без разметки)."""
+def anketa_lines(app: dict, comment_limit: int | None = None) -> list[str]:
+    """Анкета клиента в виде коротких строк (без разметки). comment_limit — обрезать
+    сообщения клиента до N символов (для таблицы в чате); None — целиком (для Excel)."""
     gender = {"Мужской": "муж.", "Женский": "жен."}.get(app.get("gender"), app.get("gender"))
     head = " · ".join(x for x in (app.get("name"), gender, age_text(app["age"]) if app.get("age") else None) if x)
     contacts = " · ".join(x for x in (
@@ -138,7 +141,11 @@ def anketa_lines(app: dict) -> list[str]:
         f"мед.: {app['medical']}" if app.get("medical") else None,
     ) if x)
     call = call_time_display(app.get("call_time"), app.get("tz_offset"))
-    return [x for x in (head, contacts, place, f"Звонить: {call}" if call else None) if x]
+    said = " / ".join((app.get("comment") or "").split("\n")).strip()
+    if said and comment_limit and len(said) > comment_limit:
+        said = said[:comment_limit - 1] + "…"
+    return [x for x in (head, contacts, place, f"Звонить: {call}" if call else None,
+                        f"Клиент пишет: {said}" if said else None) if x]
 
 
 def parse_when(text: str, now: datetime | None = None) -> datetime | None:
