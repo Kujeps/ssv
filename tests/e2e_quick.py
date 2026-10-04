@@ -32,7 +32,7 @@ async def main():
 
     # ---------- телефон ----------
     w.clear(); await w.msg(21, "8888888")
-    assert w.last_to(21)["text"] == Q.TEXTS["bad_phone"] and "не хватает цифр" in w.last_to(21)["text"]; ok("короткий номер: «Похоже, в номере не хватает цифр…»")
+    assert w.last_to(21)["text"] == Q.TEXTS["bad_phone"] and "Не получилось распознать номер" in w.last_to(21)["text"]; ok("короткий номер: «Не получилось распознать номер. Проверьте цифры…»")
     assert not con().execute("SELECT 1 FROM applications").fetchone(); ok("пока номер неверный, заявка не создаётся")
     w.clear(); await w.msg(21, "+7 (999) 123-45-67")
     admin_card = [s for s in w.to(1) if "Заявка #" in (s["text"] or "")]
@@ -42,8 +42,8 @@ async def main():
         assert part in c, (part, c)
     ok("админу пришла карточка: имя и @username из профиля, телефон, возраст, город, пол")
     t = [s["text"] for s in w.to(21)]
-    assert t == [Q.TEXTS["done"], Q.TEXTS["extra_invite"]], t; ok("клиенту: «Готово, заявка принята… специалист свяжется в ближайшее время» + приглашение дополнить")
-    assert "в ближайшее время" in t[0] and "дополнительную информацию о себе или пожелания" in t[1]; ok("в приглашении — «дополнительная информация о себе или пожелания»")
+    assert t == [Q.TEXTS["done"], Q.TEXTS["extra_invite"]], t; ok("клиенту: «Спасибо, заявка принята! Специалист свяжется с вами в ближайшее время» + приглашение дополнить")
+    assert "в ближайшее время" in t[0] and "рассказать о себе подробнее" in t[1] and "опыт, образование, пожелания" in t[1]; ok("в приглашении — «рассказать о себе подробнее: опыт, образование, пожелания»")
     note = [s for s in w.to(50) if "Поступила новая заявка" in (s["text"] or "")][-1]
     for secret in ("+7999", "Иркутск", "U21"):
         assert secret not in note["text"], secret
