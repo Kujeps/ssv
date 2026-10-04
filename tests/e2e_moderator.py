@@ -72,7 +72,7 @@ async def main():
     t = admin_card_text(a4); assert "Недозвонов: <b>1</b>" in t and "Иван" in t; ok("у админа: «Недозвонов: 1», перезвонить во столько-то")
     assert D.active_lead(50) is None; ok("модератор свободен и может брать следующую")
     w.clear(); await w.msg(50, "/start"); p = w.last_to(50)
-    assert "В ожидании (перезвонить, дозвонились): <b>1</b>" in p["text"] and "Взять заявку" in str(w.buttons(p["kb"])); ok("панель: «В ожидании: 1»")
+    assert "У вас в работе и в ожидании: <b>1</b>" in p["text"] and "Взять заявку" in str(w.buttons(p["kb"])); ok("панель: «В ожидании: 1»")
     await w.press(50, "mp:cb"); lst = w.last_to(50); assert f"mt:{a4}" in w.datas(lst["kb"]); ok("раздел «Перезвонить» с заявкой")
     await w.press(50, "mp:take"); a5 = D.active_lead(50)["id"]
     w.clear(); await w.press(50, f"mt:{a4}", mid=w.with_kb(50)); assert w.answers[-1][0] == "Сначала завершите текущую заявку"; ok("перезвон нельзя взять, пока в работе другая заявка")
