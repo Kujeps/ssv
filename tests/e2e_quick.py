@@ -20,7 +20,8 @@ async def main():
     assert t == [Q.TEXTS["hello"], Q.TEXTS["ask_method"]], t; ok("/start: две реплики — представление и «как удобнее связаться»")
     assert "помощник" in t[0] and "контрактную службу" in t[0]; ok("бот представляется помощником, а не человеком")
     assert len(w.actions) >= 2, w.actions; ok("«печатает…» перед каждой репликой: %d раз" % len(w.actions))
-    assert not w.to(1); ok("админу в личку о /start ничего не приходит")
+    n1 = [x["text"] for x in w.to(1)]
+    assert len(n1) == 1 and "Новый запуск бота" in n1[0] and "@u21" in n1[0]; ok("админу — одно уведомление о новом запуске бота")
     assert kb(w.last_to(21)) == ["qm:call", "qm:wa", "qm:tg", "qm:max"]; ok("кнопки способа связи: звонок, WhatsApp, Telegram, Max")
     assert not con().execute("SELECT 1 FROM applications").fetchone(); ok("пока контакта нет, заявки нет")
 

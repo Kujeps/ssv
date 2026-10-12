@@ -34,7 +34,7 @@ from db import (
     get_edits, get_history, get_stats, list_moderators, list_sources, mark_blocked,
     moderator_stats, parked_leads, postpone_lead, release_lead, remove_moderator,
     save_lead_message, set_setting, source_label, source_name_taken, source_names, take_callback,
-    take_lead, used_sources, build_users_xlsx, reminder_stats, reminders_enabled, users_counts,
+    take_lead, used_sources, build_users_xlsx, start_notify_enabled, reminder_stats, reminders_enabled, users_counts,
     users_page,
 )
 from form import STEP_STATES, Form
@@ -934,6 +934,14 @@ async def on_reminders_toggle(cb: CallbackQuery, bot: Bot) -> None:
             [btn("✅ Включить", "ap:remon")], [btn("↩️ Отмена", "mp:menu")],
         ]),
     )
+
+
+@staff.callback_query(F.data == "ap:sn", IsAdmin())
+async def on_start_notify_toggle(cb: CallbackQuery, bot: Bot) -> None:
+    on = not start_notify_enabled()
+    set_setting("start_notify", "1" if on else "0")
+    await cb.answer("🚀 Уведомления о запусках " + ("включены" if on else "выключены"))
+    await send_panel(bot, cb.message.chat.id, cb.from_user.id)
 
 
 @staff.callback_query(F.data == "ap:remon", IsAdmin())

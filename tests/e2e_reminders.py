@@ -34,8 +34,16 @@ async def main():
 
     # --- /start больше не шлёт админу сообщений, но пишется в журнал ---
     await w.msg(21, "/start abc"); await w.msg(21, "/start")
-    assert not w.to(1); ok("/start клиента: админу сообщений нет (ни первый, ни повторный)")
-    rows = con().execute("SELECT user_id, source, is_new FROM start_log ORDER BY id").fetchall()
+    n1 = w.to(1)
+    assert len(n1) == 1 and "Новый запуск бота" in n1[0]["text"]; ok("/start клиента: уведомление админу только о первом запуске, не о повторном")
+    D.set_setting("start_notify", "0"); w.clear(); await w.msg(22, "/start")
+    assert not w.to(1); ok("тумблер «О запусках» выключен — уведомлений нет")
+    await w.msg(1, "/start"); assert "🚀 О запусках: ВЫКЛ" in w.buttons(w.last_to(1)["kb"]); ok("в панели админа виден тумблер «О запусках»")
+    await w.press(1, "ap:sn"); assert D.start_notify_enabled(); ok("тумблер включается из панели")
+    assert "📤 Excel запустивших" in w.buttons(w.last_to(1)["kb"]); ok("в панели — кнопка «Excel запустивших»")
+    w.docs.clear(); await w.press(1, "us:x:all"); assert w.docs; ok("кнопка выгружает Excel со всеми запустившими бота")
+    sql("DELETE FROM funnel WHERE user_id=22"); sql("DELETE FROM start_log WHERE user_id=22")  # не мешаем дальнейшим подсчётам
+    rows = con().execute("SELECT user_id, source, is_new FROM start_log WHERE user_id = 21 ORDER BY id").fetchall()
     assert rows == [(21, "abc", 1), (21, None, 0)]; ok("журнал: запуск с источником и повторный запуск")
     f = con().execute("SELECT starts, last_start_at FROM funnel WHERE user_id=21").fetchone(); assert f[0] == 2 and f[1]; ok("в воронке: число запусков и время последнего")
 

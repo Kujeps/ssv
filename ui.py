@@ -13,7 +13,7 @@ from aiogram.types import (
 from config import CHOICES, HOLD_MINUTES, LOCAL_TZ, OPEN_STATUSES, REQUIRED_STEPS, STATUSES
 from db import (
     active_lead, is_moderator, list_moderators, parked_leads, queue_summary, reminders_enabled,
-    source_label,
+    source_label, start_notify_enabled,
 )
 from form import (
     BTN_BACK, BTN_SHARE, BTN_SKIP, PENDING_REVIEW, PENDING_WORK, active_steps, card,
@@ -278,9 +278,10 @@ def admin_panel(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         [btn("🗂 Все заявки", "ap:arch"), btn("👥 Модераторы", "ap:mods")],
         [btn("👤 Пользователи", "ap:users"), btn("📊 Статистика", "ap:stats")],
-        [btn("📤 Excel", "ap:export"), btn("🔗 Ссылки", "ap:links")],
-        [btn("📣 Рассылка", "ap:bc"),
-         btn(f"🔔 Напоминания: {'ВКЛ' if reminders_enabled() else 'ВЫКЛ'}", "ap:rem")],
+        [btn("📤 Excel заявок", "ap:export"), btn("📤 Excel запустивших", "us:x:all")],
+        [btn("🔗 Ссылки", "ap:links"), btn("📣 Рассылка", "ap:bc")],
+        [btn(f"🔔 Напоминания: {'ВКЛ' if reminders_enabled() else 'ВЫКЛ'}", "ap:rem"),
+         btn(f"🚀 О запусках: {'ВКЛ' if start_notify_enabled() else 'ВЫКЛ'}", "ap:sn")],
     ]
     if is_moderator(admin_id):
         active = active_lead(admin_id)

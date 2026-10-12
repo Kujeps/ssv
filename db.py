@@ -1026,6 +1026,11 @@ def set_setting(key: str, value: str) -> None:
         )
 
 
+def start_notify_enabled() -> bool:
+    """Уведомлять админов о первом запуске бота новым человеком. По умолчанию включено."""
+    return get_setting("start_notify", "1") == "1"
+
+
 def reminders_enabled() -> bool:
     """Напоминания по умолчанию выключены — админ включает их в панели."""
     return get_setting("reminders") == "1"

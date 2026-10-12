@@ -13,13 +13,14 @@ import config
 from config import CHOICES, GENDERS, REQUIRED_STEPS
 from db import (
     active_application, append_client_comment, had_started_before, log_start, save_application,
-    set_reminders_off, touch_funnel,
+    set_reminders_off, source_label, start_notify_enabled, touch_funnel,
 )
+from roles import is_staff
 from form import (
     BTN_BACK, BTN_SKIP, CONTACT_KEYS, GREETING, LAST_CONTACT_STEP, NORMALIZERS, PROMPTS,
     ERRORS, STEP_STATES, Form, active_steps, card, header, norm_phone, parse_source,
 )
-from notify import notify_moderators_queue, refresh_cards, send_lead_cards
+from notify import notify_admins, notify_moderators_queue, refresh_cards, send_lead_cards
 from quick import TEXTS as QUICK_TEXTS, begin_quick, say
 from reminders import OPTOUT_DONE
 from ui import (
@@ -112,6 +113,17 @@ async def guard(cb: CallbackQuery, state: FSMContext) -> dict | None:
 
 # ---------- обработчики ----------
 
+async def notify_new_start(bot: Bot, user: User, source: str | None) -> None:
+    username = f"@{user.username}" if user.username else "нет username"
+    lines = [
+        "🚀 <b>Новый запуск бота</b>",
+        f"👤 <a href=\"tg://user?id={user.id}\">{escape(user.full_name)}</a> · {escape(username)} · ID <code>{user.id}</code>",
+    ]
+    if source:
+        lines.append(f"🔖 Источник: <b>{escape(source_label(source) or source)}</b>")
+    await notify_admins(bot, "\n".join(lines))
+
+
 @client.message(CommandStart())
 async def on_start(
     message: Message, state: FSMContext, bot: Bot, command: CommandObject
@@ -119,7 +131,9 @@ async def on_start(
     source = parse_source(command.args)
     is_new = not had_started_before(message.from_user.id)
     touch_funnel(message.from_user, "started_at", source)
-    log_start(message.from_user, source, is_new)  # в журнал, а не админу в личку
+    log_start(message.from_user, source, is_new)  # в журнал
+    if is_new and start_notify_enabled() and not is_staff(message.from_user.id):
+        await notify_new_start(bot, message.from_user, source)  # новый человек — админам одной строкой
     pending = active_application(message.from_user.id)
     await clear_prev(bot, message.chat.id, await state.get_data())
     await state.clear()
