@@ -128,7 +128,9 @@ def anketa_lines(app: dict, comment_limit: int | None = None) -> list[str]:
     """Анкета клиента в виде коротких строк (без разметки). comment_limit — обрезать
     сообщения клиента до N символов (для таблицы в чате); None — целиком (для Excel)."""
     gender = {"Мужской": "муж.", "Женский": "жен."}.get(app.get("gender"), app.get("gender"))
-    head = " · ".join(x for x in (app.get("name"), gender, age_text(app["age"]) if app.get("age") else None) if x)
+    age = age_text(app["age"]) if app.get("age") else (
+        f"{app['age_range']} лет" if app.get("age_range") else None)
+    head = " · ".join(x for x in (app.get("name"), gender, age) if x)
     contacts = " · ".join(x for x in (
         app.get("phone"), app.get("telegram"),
         f"MAX {app['max_contact']}" if app.get("max_contact") else None,
@@ -144,7 +146,8 @@ def anketa_lines(app: dict, comment_limit: int | None = None) -> list[str]:
     said = " / ".join((app.get("comment") or "").split("\n")).strip()
     if said and comment_limit and len(said) > comment_limit:
         said = said[:comment_limit - 1] + "…"
-    return [x for x in (head, contacts, place, f"Звонить: {call}" if call else None,
+    pref = f"Связь: {app['contact_pref']}" if app.get("contact_pref") else None
+    return [x for x in (head, contacts, pref, place, f"Звонить: {call}" if call else None,
                         f"Клиент пишет: {said}" if said else None) if x]
 
 

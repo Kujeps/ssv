@@ -135,6 +135,10 @@ async def on_start(
 async def on_cancel_cmd(message: Message, state: FSMContext, bot: Bot) -> None:
     await clear_prev(bot, message.chat.id, await state.get_data())
     await state.clear()
+    if active_application(message.from_user.id):
+        # Заявка уже создана (клиент уточнял детали): отменять нечего, просто прекращаем вопросы.
+        await message.answer(QUICK_TEXTS["skipped"], reply_markup=ReplyKeyboardRemove())
+        return
     await message.answer("🚫 Заявка отменена.", reply_markup=apply_keyboard())
 
 

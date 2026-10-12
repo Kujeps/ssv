@@ -138,7 +138,7 @@ def lead_text(app: dict, view: str = "admin", viewer_id: int | None = None) -> s
     data = {
         "name": app["name"], "phone": app["phone"], "tg": app["telegram"],
         "max": app["max_contact"], "wa": app["whatsapp"], "gender": app["gender"],
-        "medical": app["medical"], "age": app["age"], "city": app["city"],
+        "medical": app["medical"], "age": app["age"] or app.get("age_range"), "city": app["city"],
         "unit": app["unit"], "served": app["served"], "tz": tz_text(tz_offset),
         "call_time": call_time_display(app["call_time"], tz_offset), "comment": app["comment"],
     }
@@ -148,6 +148,8 @@ def lead_text(app: dict, view: str = "admin", viewer_id: int | None = None) -> s
         "",
         card(data, skip_empty=True),
     ]
+    if app.get("contact_pref"):
+        lines.append(f"📌 <b>Удобный способ связи:</b> {escape(app['contact_pref'])}")
     if app.get("extra"):
         lines += ["", f"ℹ️ <b>Доп. информация:</b>\n{escape(app['extra'])}"]
     lines += [

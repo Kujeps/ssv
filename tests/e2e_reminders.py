@@ -28,7 +28,7 @@ async def main():
     # --- график ---
     assert C.REMINDER_DELAYS_HOURS == [1, 5, 18, 24, 24, 24] and C.REMINDER_WINDOW_MSK == (10, 20)
     import staff as S; assert S.schedule_text() == "1, 6, 24, 48, 72 и 96 ч после запуска бота"; ok("график: 1 ч, 6 ч, 24 ч, затем ещё 3 раза через каждые 24 ч (1, 6, 24, 48, 72, 96)")
-    assert len(R.TEXTS["start"]) == 6 and len(R.TEXTS["form"]) == 6
+    assert len(R.TEXTS["start"]) == 6 and len(R.TEXTS["form"]) == 6 and len(R.TEXTS["contact"]) == 6
     t3 = R.TEXTS["start"][2]; assert "Остались вопросы?" in t3 and "ответим на все ваши вопросы" in t3; ok("текст суточного напоминания: «Остались вопросы? … ответим на все ваши вопросы»")
     assert not D.reminders_enabled(); ok("по умолчанию тумблер напоминаний ВЫКЛЮЧЕН")
 
@@ -51,6 +51,14 @@ async def main():
     user(1, started=5); user(50, started=5)       # админ и модератор
     user(38, started=240)                         # H: старый пользователь (10 суток назад)
     R_orig_window = R.REMINDER_WINDOW_MSK; R.REMINDER_WINDOW_MSK = (0, 24)
+
+    # --- выбрал способ связи, но контакт не оставил — своя группа «contact» ---
+    user(39, started=3, form=True)
+    sql("UPDATE funnel SET contact_at = datetime('now','-30 minutes') WHERE user_id=39")
+    cand = {c["user_id"]: c for c in D.reminder_candidates([1, 50])}
+    assert cand[39]["group"] == "contact" and cand[34]["group"] == "form" and cand[32]["group"] == "start"; ok("кто остановился на контакте — группа «contact», бросившие анкету — «form», остальные — «start»")
+    assert "контакт" in R.TEXTS["contact"][0] and R.BUTTON_TEXT["contact"]; ok("у группы «contact» свои тексты и кнопка")
+    sql("DELETE FROM funnel WHERE user_id=39")
 
     # --- выключено: ничего не отправляется ---
     w.clear(); n = await R.run_reminders(w.bot); assert n == 0 and not w.sent; ok("при выключенном тумблере ничего не отправляется")

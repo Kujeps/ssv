@@ -92,6 +92,8 @@ def init_db() -> None:
             "gender": "TEXT",
             "medical": "TEXT",
             "age": "INTEGER",
+            "age_range": "TEXT",                  # возраст диапазоном (кнопкой в диалоге)
+            "contact_pref": "TEXT",               # как клиенту удобнее общаться: Звонок / WhatsApp / ...
             "city": "TEXT",
             "unit": "TEXT",
             "served": "TEXT",
@@ -127,6 +129,7 @@ def init_db() -> None:
             "rem_last_at": "TEXT",
             "rem_first_at": "TEXT",
             "rem_off": "INTEGER DEFAULT 0",       # нажал «Не напоминать»
+            "contact_at": "TEXT",                 # выбрал способ связи, но контакт не оставил
         })
         db.execute(
             """
@@ -253,7 +256,7 @@ def _migrate_queue(db: sqlite3.Connection) -> None:
 # ---------- воронка и рассылка ----------
 
 def touch_funnel(user, stage: str, source: str | None = None) -> None:
-    assert stage in ("started_at", "started_form_at", "completed_at")
+    assert stage in ("started_at", "started_form_at", "contact_at", "completed_at")
     with closing(connect()) as db, db:
         # Источник (метка рекламы) запоминается по первому заходу с меткой.
         db.execute(
@@ -355,8 +358,8 @@ def save_application(user, data: dict) -> int:
             "INSERT INTO applications"
             " (user_id, username, full_name, name, phone, telegram, max_contact, whatsapp,"
             "  gender, medical, age, city, unit, served, call_time, comment, source,"
-            "  tz_offset, status, queued_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', CURRENT_TIMESTAMP)",
+            "  tz_offset, contact_pref, age_range, status, queued_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', CURRENT_TIMESTAMP)",
             (
                 user.id, user.username, user.full_name,
                 data.get("name"), data.get("phone"), data.get("tg"),
@@ -364,10 +367,26 @@ def save_application(user, data: dict) -> int:
                 data.get("gender"), data.get("medical"), int(age) if age else None, data.get("city"),
                 data.get("unit"), data.get("served"), data.get("call_time"),
                 data.get("comment"), row[0] if row else None,
-                TZ_BY_LABEL.get(data.get("tz")),
+                TZ_BY_LABEL.get(data.get("tz")), data.get("pref"), data.get("age_range"),
             ),
         )
         return cur.lastrowid
+
+
+def update_client_details(app_id: int, user_id: int, fields: dict) -> bool:
+    """Клиент сам дополняет свою действующую заявку (возраст, город, пол) в диалоге."""
+    allowed = {"age", "age_range", "city", "gender"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return False
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    with closing(connect()) as db, db:
+        cur = db.execute(
+            f"UPDATE applications SET {sets} WHERE id = ? AND user_id = ?"
+            f" AND COALESCE(status, 'new') IN ({_marks(BLOCKING_STATUSES)})",
+            (*fields.values(), app_id, user_id, *BLOCKING_STATUSES),
+        )
+    return cur.rowcount > 0
 
 
 def active_application(user_id: int) -> dict | None:
@@ -971,7 +990,7 @@ def build_export_xlsx(filters: dict | None = None, scope_mod: int | None = None)
         ws.append([safe_cell(v) for v in [
             a["id"], fmt_ts(a["created_at"], "%d.%m.%Y %H:%M"),
             fmt_ts(a["assigned_at"], "%d.%m.%Y %H:%M") if a["assigned_at"] else "", a["name"], a["phone"],
-            a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["medical"], a["age"],
+            a["telegram"], a["max_contact"], a["whatsapp"], a["gender"], a["medical"], a["age"] or a["age_range"],
             a["city"], tz_text(a["tz_offset"]), a["unit"], a["served"],
             call_time_display(a["call_time"], a["tz_offset"]), a["comment"],
             names.get(a["source"], a["source"]), STATUSES.get(status, STATUSES["new"])[1],
@@ -1123,7 +1142,7 @@ def reminder_candidates(staff_ids: list[int]) -> list[dict]:
     with closing(connect()) as db:
         db.row_factory = sqlite3.Row
         rows = db.execute(
-            "SELECT user_id, started_at, started_form_at, rem_count, rem_last_at FROM funnel"
+            "SELECT user_id, started_at, started_form_at, contact_at, rem_count, rem_last_at FROM funnel"
             " WHERE started_at IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL"
             " AND COALESCE(rem_off, 0) = 0 AND COALESCE(rem_count, 0) < ?"
             f" AND user_id NOT IN ({marks})"
@@ -1138,7 +1157,7 @@ def reminder_candidates(staff_ids: list[int]) -> list[dict]:
             continue
         result.append({
             "user_id": r["user_id"], "stage": stage,
-            "group": "form" if r["started_form_at"] else "start",
+            "group": "contact" if r["contact_at"] else "form" if r["started_form_at"] else "start",
             "due_at": base + timedelta(hours=delays[stage]),
         })
     return sorted(result, key=lambda c: c["due_at"])
