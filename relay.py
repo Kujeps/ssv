@@ -80,7 +80,9 @@ def topic_title(app: dict) -> str:
 
 
 def manager_label(app: dict) -> str:
-    return "Менеджер " + manager_display_name(app["assigned_to"]) if app.get("assigned_to") else "Менеджер"
+    if not app.get("assigned_to"):
+        return "Менеджер"
+    return "Менеджер " + manager_display_name(app["assigned_to"], app.get("assigned_name"))
 
 
 def card_text(app: dict) -> str:

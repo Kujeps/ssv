@@ -163,6 +163,12 @@ async def main():
     assert D.get_setting("relay_backfill") == "0" and any("Темы для всех открытых заявок созданы" in (s["text"] or "") for s in w.to(1)); ok("по окончании админ получает «готово», режим выключается")
     await w.msg(1, "/relay_sync"); assert "уже в темах" in w.last_to(1)["text"]; ok("повторный /relay_sync: создавать нечего")
 
+    # ---------- имя по умолчанию берётся из профиля Telegram ----------
+    D.add_moderator(77, "", None, 1)
+    assert D.manager_display_name(77, "Сергей Петров") == "Сергей"; ok("имя не задано: подпись — имя из профиля Telegram («Менеджер Сергей»), а не «менеджер менеджер»")
+    assert D.manager_display_name(77, "Серёжа") == "Серёжа"; ok("сменил имя в профиле — подпись сменилась")
+    D.set_setting("mgr_name:77", "Дмитрий"); assert D.manager_display_name(77, "Серёжа") == "Дмитрий"; ok("заданное в боте имя важнее профиля")
+
     # ---------- группа отключена ----------
     await w.msg(1, "/relay_off"); await w.gmsg(1, G, None, "/relay_off")
     assert D.relay_chat_id() is None; ok("/relay_off отключает переписку")

@@ -1447,12 +1447,13 @@ def relay_chat_id() -> int | None:
 
 
 def manager_display_name(user_id: int, fallback: str | None = None) -> str:
-    """Имя, под которым менеджер подписан для клиента (меняется командой /name)."""
+    """Имя, под которым менеджер подписан для клиента. Если он задал своё («Имя для клиентов») — оно;
+    иначе имя из его профиля Telegram на момент сообщения (поменял в профиле — поменяется и здесь)."""
     name = get_setting(f"mgr_name:{user_id}")
     if name:
         return name
     mod = next((m for m in list_moderators() if m["user_id"] == user_id), None)
-    base = ((mod and mod["name"]) or fallback or "").strip()
+    base = (fallback or (mod and mod["name"]) or "").strip()
     return base.split()[0] if base else "менеджер"
 
 
