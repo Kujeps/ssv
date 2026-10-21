@@ -1553,6 +1553,17 @@ def latest_application(user_id: int) -> dict | None:
         ).fetchone())
 
 
+def taken_without_topic(limit: int = 3) -> list[int]:
+    """Только что взятые заявки («Взята»), для которых тема ещё не создалась (например, из-за лимита Telegram)."""
+    with closing(connect()) as db:
+        rows = db.execute(
+            "SELECT a.id FROM applications a LEFT JOIN relay_topics t ON t.app_id = a.id"
+            " WHERE a.status = 'work' AND a.assigned_to IS NOT NULL AND t.app_id IS NULL ORDER BY a.id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 def open_assigned_app_ids() -> list[int]:
     with closing(connect()) as db:
         rows = db.execute(

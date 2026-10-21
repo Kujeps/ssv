@@ -23,6 +23,11 @@ async def main():
     await w.gmsg(1, G, None, "/relay_here"); assert D.relay_chat_id() == G; ok("/relay_here админа в группе с темами — группа подключена")
     await w.msg(1, "/start"); assert "переписка через группу: <b>подключена</b>" in w.last_to(1)["text"]; ok("в панели админа видно, что группа подключена")
 
+    # ---------- подключение не создаёт темы для старых заявок разом ----------
+    # (заявка #0: взята до подключения группы)
+    w.calls.clear()
+    assert not calls("CreateForumTopic"); ok("подключение группы не создаёт тем (нет всплеска запросов к Telegram)")
+
     # ---------- заявка и вложение клиента до взятия ----------
     await w.msg(21, "/start"); await w.press(21, "qm:call"); await w.msg(21, "+7 999 123-45-67")
     await w.media(21, "photo", "мой паспорт")
@@ -31,10 +36,15 @@ async def main():
     assert not calls("CreateForumTopic"); ok("пока заявку не взяли, темы нет")
 
     # ---------- менеджер берёт заявку: появляется тема ----------
-    w.clear(); await w.press(50, "mp:take")
+    w.clear(); w.flood = 1; await w.press(50, "mp:take")   # Telegram просит подождать
+    assert D.get_application(1)["status"] == "work" and D.relay_topic(1) is None; ok("лимит Telegram на создание тем: бот не падает и не зависает, заявка взята")
+    assert not any("Не получилось создать" in (s["text"] or "") for s in w.to(1)); ok("админам из-за лимита тревоги нет")
+    assert D.taken_without_topic() == [1]; ok("заявка без темы поставлена в очередь на повторную попытку")
+    assert R._flood_until > 0; R._flood_until = 0   # «время ожидания прошло»
+    await R.retry_topics(w.bot); assert D.relay_topic(1) is not None; ok("фоновая проверка создала тему, когда лимит снялся")
     t = calls("CreateForumTopic"); assert len(t) == 1 and t[0].name.startswith("#1 U21"), t; ok("взял заявку → создана тема «#1 U21»")
     card = [s for s in w.sent if s["chat"] == G and s["thread"] and "Заявка #1" in (s["text"] or "")][0]
-    assert "+79991234567" in card["text"] and "Менеджер Иван" in card["text"] and "/name" in card["text"]; ok("первое сообщение темы — карточка клиента и подсказка про подпись и /name")
+    assert "+79991234567" in card["text"] and "Менеджер Иван" in card["text"] and "Имя для клиентов" in card["text"]; ok("первое сообщение темы — карточка клиента и подсказка про подпись и кнопку смены имени")
     assert w.datas(card["kb"]) == ["rt:1:agreed", "rt:1:refused", "rt:1:reached", "rt:1:nocall", "rt:1:junk", "rt:1:release"]; ok("под карточкой кнопки статусов")
     assert calls("PinChatMessage"); ok("карточка закреплена в теме")
     cp = calls("CopyMessage"); assert len(cp) == 1 and cp[0].chat_id == G and "мой паспорт" in cp[0].caption and "👤" in cp[0].caption; ok("вложение, присланное до взятия, перенесено в тему с пометкой клиента")
@@ -47,7 +57,16 @@ async def main():
     w.clear(); m1 = await w.gmsg(50, G, thread, "Здравствуйте! Удобно сейчас говорить?")
     out = w.last_to(21); assert out["text"] == "<b>Менеджер Иван:</b>\nЗдравствуйте! Удобно сейчас говорить?"; ok("текст менеджера уходит клиенту: «Менеджер Иван: …»")
     assert calls("SetMessageReaction"); ok("менеджер видит реакцию — доставлено")
-    await w.msg(50, "/name Дмитрий"); assert "Менеджер Дмитрий" in w.last_to(50)["text"]; ok("/name Дмитрий — имя для клиентов сменено")
+    await w.msg(50, "/start"); assert "nm:open" in w.datas(w.last_to(50)["kb"]); ok("в панели менеджера есть кнопка «Имя для клиентов»")
+    await w.press(50, "nm:open"); t = w.last_to(50)["text"]
+    assert "Менеджер Иван" in t and "Так выглядит ваше сообщение у клиента" in t and "Здравствуйте! Это по поводу вашей заявки" in t; ok("кнопка показывает текущее имя и предпросмотр: как сообщение выглядит у клиента")
+    await w.msg(50, "x" * 40); assert "от 1 до 30" in w.last_to(50)["text"]; ok("слишком длинное имя отклоняется")
+    await w.msg(50, "Менеджер Дмитрий"); t = w.last_to(50)["text"]
+    assert "Имя сохранено" in t and "<b>Менеджер Дмитрий:</b>\nЗдравствуйте!" in t and "nm:open" in w.datas(w.last_to(50)["kb"]); ok("новое имя сохранено (лишнее «Менеджер» убрано), сразу виден предпросмотр")
+    assert D.get_setting("mgr_name:50") == "Дмитрий"; ok("в базе: «Дмитрий»")
+    await w.msg(50, "/name"); assert "Менеджер Дмитрий" in w.last_to(50)["text"]; ok("/name без имени тоже показывает предпросмотр")
+    await w.press(1, "nm:open"); await w.msg(1, "Алексей"); assert D.get_setting("mgr_name:1") == "Алексей"; ok("админ (если сам отвечает клиентам) тоже задаёт имя кнопкой")
+    await w.press(21, "nm:open"); assert not [s for s in w.to(21) if "Так выглядит" in (s["text"] or "")]; ok("клиент кнопкой имени воспользоваться не может")
     w.clear(); await w.gmsg(50, G, thread, "Дмитрий на связи")
     assert w.last_to(21)["text"].startswith("<b>Менеджер Дмитрий:</b>"); ok("теперь подпись «Менеджер Дмитрий»")
     w.calls.clear(); await w.gmsg(50, G, thread, photo=[{"file_id": "p", "file_unique_id": "u", "width": 1, "height": 1}], caption="Вот список документов")

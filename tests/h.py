@@ -83,6 +83,10 @@ class World:
                     world.actions.append((method.chat_id, str(method.action)))
                     return True
                 if name == "CreateForumTopic":
+                    if world.flood > 0:
+                        from aiogram.exceptions import TelegramRetryAfter
+                        world.flood -= 1
+                        raise TelegramRetryAfter(method=method, message="Flood control", retry_after=30)
                     self.n += 1
                     world.calls.append((name, method))
                     return method.__returning__.model_validate(
@@ -103,6 +107,7 @@ class World:
         self.sent, self.edits, self.markups, self.deleted = [], [], [], []
         self.answers, self.docs, self.commands, self.actions = [], [], [], []
         self.calls = []
+        self.flood = 0
         self.last, self.forbidden = {}, set()
         self.n = 0
         self.session = Fake()

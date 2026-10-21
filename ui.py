@@ -262,6 +262,7 @@ def mod_panel(mod_id: int) -> tuple[str, InlineKeyboardMarkup]:
             else [btn("📥 Взять заявку", "mp:take")]]
     rows.append([btn("📋 Моя таблица", "tb:open"), btn(f"🔁 В ожидании ({len(parked)})", "mp:cb")])
     rows.append([btn("🗂 Мои заявки", "mp:arch"), btn("📊 Моя статистика", "mp:stats")])
+    rows.append([btn("✏️ Имя для клиентов", "nm:open")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -290,5 +291,6 @@ def admin_panel(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([btn(f"📂 Моя заявка #{active['id']}", "mp:active")] if active
                     else [btn("📥 Взять заявку", "mp:take")])
         rows.append([btn("📋 Моя таблица", "tb:open")])
+    rows.append([btn("✏️ Имя для клиентов", "nm:open")])
     rows.append([btn("📝 Подать заявку (проверка формы)", "apply")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)

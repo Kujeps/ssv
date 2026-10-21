@@ -18,8 +18,10 @@ from html import escape
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import BaseFilter, Command, CommandObject
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import BaseFilter, Command, CommandObject, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReactionTypeEmoji
 
 import config
@@ -27,11 +29,11 @@ from config import AUTO_REPLY_EVERY_HOURS, CALLBACK_OPTIONS, MSK, NOCALL_ALERT_A
 from config import REASON_REQUIRED, STATUSES, WORK_HOURS_MSK
 from db import (
     add_note, callback_time, change_status, finish_lead, get_application, latest_application, manager_display_name,
-    mark_blocked, open_assigned_app_ids, postpone_lead, release_lead, relay_chat_id, relay_log_add,
+    mark_blocked, postpone_lead, taken_without_topic, release_lead, relay_chat_id, relay_log_add,
     relay_log_by_group_msg, relay_log_pending, relay_log_set, relay_topic, relay_topic_by_thread,
     relay_topic_delete, relay_topic_save, relay_topic_update, set_setting,
 )
-from roles import is_admin, is_staff
+from roles import IsStaff as IsStaffFilter, is_admin, is_staff
 from ui import btn, lead_text
 from utils import parse_utc, utc_now, utc_str
 
@@ -52,6 +54,7 @@ REOPEN_ACK = "Сообщение получил и передал менедже
 # Ожидание причины/комментария от менеджера в теме: (чат, тема, пользователь) -> (действие, номер заявки)
 PENDING: dict[tuple[int, int, int], tuple[str, int]] = {}
 _last_warn = 0.0
+_flood_until = 0.0  # Telegram ограничил создание тем — до этого момента не пытаемся
 
 
 # ---------- вспомогательное ----------
@@ -85,7 +88,7 @@ def card_text(app: dict) -> str:
     if app["status"] in OPEN_STATUSES:
         text += (
             f"\n\n💬 Всё, что вы пишете в этой теме, уходит клиенту как «<b>{escape(manager_label(app))}</b>». "
-            "Заметка для себя — сообщение, начинающееся с <code>#</code>. Сменить имя: <code>/name Имя</code>."
+            "Заметка для себя — сообщение, начинающееся с <code>#</code>. Имя меняется в боте: «✏️ Имя для клиентов»."
         )
     return text[:4000]
 
@@ -136,6 +139,11 @@ async def sync_topic(bot: Bot, app_id: int) -> None:
         return
     try:
         await _sync(bot, chat, app_id)
+    except TelegramRetryAfter as e:
+        # Лимит Telegram на создание тем: не ждём (бот не должен вставать), повторим позже сами.
+        global _flood_until
+        _flood_until = time.time() + e.retry_after
+        logging.warning("Telegram просит подождать %s с перед созданием темы заявки #%s", e.retry_after, app_id)
     except Exception as e:
         logging.exception("Тема заявки #%s: не удалось обновить", app_id)
         await warn_admins(
@@ -189,6 +197,8 @@ async def _update_card(bot: Bot, topic: dict | None, app: dict) -> None:
 
 
 async def _create_topic(bot: Bot, chat: int, app: dict) -> None:
+    if time.time() < _flood_until:
+        return  # подождём окончания лимита; тему создаст следующая проверка
     created = await bot.create_forum_topic(chat, topic_title(app))
     thread = created.message_thread_id
     card = await bot.send_message(chat, card_text(app), reply_markup=card_keyboard(app), message_thread_id=thread)
@@ -234,9 +244,10 @@ async def from_client(bot: Bot, message: Message) -> bool:
     if app["status"] == "new":  # ещё в очереди: запоминаем, менеджер увидит, когда заявку возьмут
         relay_log_add(app["id"], "in", kind, text, file_id_of(message), None, message.message_id)
         return False
-    if app["status"] in OPEN_STATUSES:
-        await sync_topic(bot, app["id"])  # на случай, если группу подключили после взятия заявки
     topic = relay_topic(app["id"])
+    if topic is None and app["status"] in OPEN_STATUSES:
+        await sync_topic(bot, app["id"])  # тема создаётся, когда клиент пишет по заявке, взятой до подключения группы
+        topic = relay_topic(app["id"])
     if topic is None or topic["chat_id"] != chat:
         relay_log_add(app["id"], "in", kind, text, file_id_of(message), None, message.message_id)
         return False
@@ -277,6 +288,16 @@ async def from_client(bot: Bot, message: Message) -> bool:
         with suppress(Exception):
             await bot.send_message(user.id, AUTO_TEXT.format(start=WORK_HOURS_MSK[0]))
     return True
+
+
+async def retry_topics(bot: Bot) -> None:
+    """Фоновая попытка создать темы для только что взятых заявок (если раньше мешал лимит Telegram)."""
+    if not relay_chat_id() or time.time() < _flood_until:
+        return
+    for app_id in taken_without_topic(3):
+        await sync_topic(bot, app_id)
+        if time.time() < _flood_until:
+            break
 
 
 def _auto_reply_due(topic: dict) -> bool:
@@ -513,9 +534,9 @@ async def on_relay_here(message: Message, bot: Bot) -> None:
     await message.answer(
         "✅ Группа подключена. Когда менеджер берёт заявку, здесь появляется тема с карточкой клиента; "
         "всё, что менеджер пишет в теме, уходит клиенту от имени бота. Бот должен быть администратором "
-        "с правом «Управление темами», а менеджер — участником группы.")
-    for app_id in open_assigned_app_ids():
-        await sync_topic(bot, app_id)
+        "с правом «Управление темами», а менеджер — участником группы.\n\n"
+        "Темы для заявок, взятых раньше, не создаются разом (Telegram ограничивает частоту): тема появится, когда "
+        "менеджер возьмёт новую заявку или клиент по старой напишет.")
 
 
 @setup.message(Command("relay_off"))
@@ -526,19 +547,79 @@ async def on_relay_off(message: Message) -> None:
     await message.answer("Переписка через группу отключена. Существующие темы остаются, но бот их больше не обслуживает.")
 
 
+class NameFlow(StatesGroup):
+    text = State()
+
+
+PREVIEW_SAMPLE = "Здравствуйте! Это по поводу вашей заявки. Вам удобно сейчас поговорить?"
+
+
+def name_preview(user_id: int, fallback: str | None, name: str | None = None) -> str:
+    """Как клиент увидит сообщение менеджера."""
+    shown = name or manager_display_name(user_id, fallback)
+    return (
+        f"Сейчас клиенты видят вас как «<b>Менеджер {escape(shown)}</b>».\n\n"
+        "👀 <b>Так выглядит ваше сообщение у клиента:</b>\n"
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+        f"<b>Менеджер {escape(shown)}:</b>\n{PREVIEW_SAMPLE}\n"
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+    )
+
+
+NAME_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [btn("✏️ Изменить имя", "nm:open")], [btn("🏠 Меню", "mp:menu")],
+])
+
+
+def clean_name(text: str) -> str | None:
+    name = " ".join(text.split())
+    if name.lower().startswith("менеджер "):
+        name = name[9:].strip()
+    return name if 1 <= len(name) <= 30 else None
+
+
+@setup.callback_query(F.data == "nm:open", IsStaffFilter())
+async def on_name_open(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
+    await state.set_state(NameFlow.text)
+    await cb.message.answer(
+        name_preview(cb.from_user.id, cb.from_user.full_name)
+        + "\n\n✏️ Напишите имя, под которым клиенты будут видеть вас (до 30 символов), например: <code>Дмитрий</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("↩️ Отмена", "nm:cancel")]]),
+    )
+
+
+@setup.callback_query(F.data == "nm:cancel", IsStaffFilter())
+async def on_name_cancel(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(None)
+    await cb.answer("Отменено")
+    with suppress(TelegramBadRequest):
+        await cb.message.edit_reply_markup(reply_markup=None)
+
+
+@setup.message(StateFilter(NameFlow.text), F.chat.type == ChatType.PRIVATE, F.text, ~F.text.startswith("/"))
+async def on_name_text(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    name = clean_name(message.text)
+    if name is None:
+        await message.answer("Имя должно быть от 1 до 30 символов. Напишите ещё раз.")
+        return
+    set_setting(f"mgr_name:{user.id}", name)
+    await state.set_state(None)
+    await message.answer("✅ Имя сохранено.\n\n" + name_preview(user.id, user.full_name), reply_markup=NAME_KEYBOARD)
+
+
 @setup.message(Command("name"))
-async def on_name(message: Message, command: CommandObject) -> None:
+async def on_name(message: Message, command: CommandObject, state: FSMContext) -> None:
     user = message.from_user
     if user is None or not is_staff(user.id):
         return
-    name = (command.args or "").strip()
-    if not name:
-        await message.answer(
-            f"Сейчас клиенты видят вас как «<b>Менеджер {escape(manager_display_name(user.id, user.full_name))}</b>». "
-            "Чтобы изменить: <code>/name Дмитрий</code>.")
+    await state.set_state(None)
+    name = clean_name(command.args or "") if command.args else None
+    if command.args and name is None:
+        await message.answer("Имя должно быть от 1 до 30 символов.")
         return
-    if len(name) > 30:
-        await message.answer("Слишком длинное имя — до 30 символов.")
-        return
-    set_setting(f"mgr_name:{user.id}", name)
-    await message.answer(f"✅ Теперь клиенты видят вас как «<b>Менеджер {escape(name)}</b>».")
+    if name:
+        set_setting(f"mgr_name:{user.id}", name)
+    await message.answer(("✅ Имя сохранено.\n\n" if name else "") + name_preview(user.id, user.full_name),
+                         reply_markup=NAME_KEYBOARD)

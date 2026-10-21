@@ -91,9 +91,11 @@ async def run_maintenance(bot: Bot, now: datetime | None = None) -> None:
 
 
 async def maintenance_loop(bot: Bot) -> None:
+    from relay import retry_topics
     while True:
         try:
             await run_maintenance(bot)
+            await retry_topics(bot)
         except Exception:
             logging.exception("Ошибка фоновой проверки")
         await asyncio.sleep(CHECK_EVERY_SECONDS)
