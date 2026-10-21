@@ -13,7 +13,7 @@ from aiogram.types import (
 from config import CHOICES, HOLD_MINUTES, LOCAL_TZ, OPEN_STATUSES, REQUIRED_STEPS, STATUSES
 from db import (
     active_lead, is_moderator, list_moderators, parked_leads, queue_summary, reminders_enabled,
-    source_label, start_notify_enabled,
+    source_label, start_notify_enabled, relay_chat_id,
 )
 from form import (
     BTN_BACK, BTN_SHARE, BTN_SKIP, PENDING_REVIEW, PENDING_WORK, active_steps, card,
@@ -273,7 +273,9 @@ def admin_panel(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
         f"📥 В очереди: <b>{summary.get('new', 0)}</b> · 🔧 Взято: <b>{summary.get('work', 0)}</b>"
         f" · ⏳ В работе: <b>{summary.get('reached', 0)}</b>"
         f" · 🔁 Перезвонить: <b>{summary.get('nocall', 0) + summary.get('callback', 0)}</b>",
-        f"👥 Модераторов: <b>{len(list_moderators())}</b>",
+        f"👥 Модераторов: <b>{len(list_moderators())}</b>"
+        + (" · 💬 переписка через группу: <b>подключена</b>" if relay_chat_id()
+           else " · 💬 переписка: группа не подключена (/relay_here)"),
     ]
     rows = [
         [btn("🗂 Все заявки", "ap:arch"), btn("👥 Модераторы", "ap:mods")],

@@ -19,12 +19,15 @@ from config import ADMIN_USER_IDS, BOT_TOKEN, DB_PATH
 from db import init_db, moderator_ids
 from jobs import maintenance_loop
 from quick import quick
+from relay import relay, setup as relay_setup
 from staff import staff
 from table import table
 
 bot_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 # Порядок важен: сначала таблица модератора и персонал (админ, модераторы), затем клиенты.
+dp.include_router(relay_setup)
+dp.include_router(relay)
 dp.include_router(table)
 dp.include_router(staff)
 dp.include_router(quick)

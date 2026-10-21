@@ -34,6 +34,7 @@ from db import (
 )
 from form import parse_intro
 from notify import notify_moderators_queue, refresh_cards, send_lead_cards
+from relay import from_client as relay_from_client
 from ui import btn, pending_notice
 from utils import norm_phone
 
@@ -323,6 +324,8 @@ async def on_details_text(message: Message, state: FSMContext, bot: Bot) -> None
     elif bad_age:
         await say(bot, chat_id, TEXTS["age_range"].format(min=MIN_AGE, max=MAX_AGE))
     else:
+        if await relay_from_client(bot, message):  # менеджер уже переписывается с клиентом
+            return
         # Не ответ на вопрос — возможно, человек пишет о себе: сохраняем в заявку и повторяем вопрос.
         text = message.text.strip()
         if len(text) >= 6:
@@ -337,4 +340,6 @@ async def on_details_text(message: Message, state: FSMContext, bot: Bot) -> None
 async def on_details_other(message: Message, bot: Bot) -> None:
     if (message.text or "").startswith("/"):
         raise SkipHandler  # команды (/start, /cancel) обрабатывает клиентская часть
+    if await relay_from_client(bot, message):
+        return
     await say(bot, message.chat.id, TEXTS["unparsed"])

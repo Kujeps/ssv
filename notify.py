@@ -39,6 +39,8 @@ async def refresh_cards(bot: Bot, app_id: int) -> None:
                 lead_text(app, view, chat_id), chat_id=chat_id, message_id=message_id,
                 reply_markup=lead_keyboard(app, view, chat_id),
             )
+    from relay import sync_topic  # тема в группе переписки (если подключена)
+    await sync_topic(bot, app_id)
 
 
 async def notify_moderators_queue(bot: Bot, headline: str = "🔔 Поступила новая заявка") -> None:

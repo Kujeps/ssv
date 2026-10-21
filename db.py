@@ -229,6 +229,37 @@ def init_db() -> None:
             )
             """
         )
+        # Переписка менеджера с клиентом: тема в группе на каждую заявку и журнал всех сообщений.
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relay_topics (
+                app_id INTEGER PRIMARY KEY,
+                chat_id INTEGER,
+                thread_id INTEGER,
+                card_msg_id INTEGER,
+                closed INTEGER DEFAULT 0,
+                auto_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relay_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id INTEGER,
+                direction TEXT,        -- in (клиент), out (менеджер), note (заметка)
+                kind TEXT,
+                text TEXT,
+                file_id TEXT,
+                group_msg_id INTEGER,  -- сообщение в теме (NULL — ещё не доставлено в тему)
+                client_msg_id INTEGER, -- сообщение в чате с клиентом
+                by_name TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS relay_log_app ON relay_log (app_id, group_msg_id)")
         _migrate_queue(db)
 
 
@@ -1406,3 +1437,126 @@ def append_client_comment(user_id: int, text: str) -> int | None:
         new = f"{row[1]}\n{text}" if row[1] else text
         db.execute("UPDATE applications SET comment = ? WHERE id = ?", (new[:1500], row[0]))
     return row[0]
+
+
+# ---------- переписка менеджера с клиентом ----------
+
+def relay_chat_id() -> int | None:
+    """Группа с темами: из .env (RELAY_CHAT_ID) или из команды /relay_here."""
+    return config.RELAY_CHAT_ID or int(get_setting("relay_chat") or 0) or None
+
+
+def manager_display_name(user_id: int, fallback: str | None = None) -> str:
+    """Имя, под которым менеджер подписан для клиента (меняется командой /name)."""
+    name = get_setting(f"mgr_name:{user_id}")
+    if name:
+        return name
+    mod = next((m for m in list_moderators() if m["user_id"] == user_id), None)
+    base = ((mod and mod["name"]) or fallback or "").strip()
+    return base.split()[0] if base else "менеджер"
+
+
+def _relay_row(row) -> dict | None:
+    return dict(row) if row else None
+
+
+def relay_topic(app_id: int) -> dict | None:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        return _relay_row(db.execute("SELECT * FROM relay_topics WHERE app_id = ?", (app_id,)).fetchone())
+
+
+def relay_topic_by_thread(chat_id: int, thread_id: int) -> dict | None:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        return _relay_row(db.execute(
+            "SELECT * FROM relay_topics WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
+        ).fetchone())
+
+
+def relay_topic_save(app_id: int, chat_id: int, thread_id: int, card_msg_id: int | None) -> None:
+    with closing(connect()) as db, db:
+        db.execute(
+            "INSERT OR REPLACE INTO relay_topics (app_id, chat_id, thread_id, card_msg_id, closed)"
+            " VALUES (?, ?, ?, ?, 0)", (app_id, chat_id, thread_id, card_msg_id),
+        )
+
+
+def relay_topic_update(app_id: int, **fields) -> None:
+    allowed = {"card_msg_id", "closed", "auto_at"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if fields:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with closing(connect()) as db, db:
+            db.execute(f"UPDATE relay_topics SET {sets} WHERE app_id = ?", (*fields.values(), app_id))
+
+
+def relay_topic_delete(app_id: int) -> None:
+    with closing(connect()) as db, db:
+        db.execute("DELETE FROM relay_topics WHERE app_id = ?", (app_id,))
+
+
+def relay_log_add(app_id: int, direction: str, kind: str, text: str | None, file_id: str | None,
+                  group_msg_id: int | None, client_msg_id: int | None, by_name: str | None = None) -> int:
+    with closing(connect()) as db, db:
+        cur = db.execute(
+            "INSERT INTO relay_log (app_id, direction, kind, text, file_id, group_msg_id, client_msg_id, by_name)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (app_id, direction, kind, text, file_id, group_msg_id, client_msg_id, by_name),
+        )
+        return cur.lastrowid
+
+
+def relay_log_set(log_id: int, **fields) -> None:
+    allowed = {"group_msg_id", "client_msg_id"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if fields:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with closing(connect()) as db, db:
+            db.execute(f"UPDATE relay_log SET {sets} WHERE id = ?", (*fields.values(), log_id))
+
+
+def relay_log_pending(app_id: int) -> list[dict]:
+    """Сообщения клиента, написанные до того, как появилась тема (ещё не показаны менеджеру)."""
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT * FROM relay_log WHERE app_id = ? AND direction = 'in' AND group_msg_id IS NULL ORDER BY id",
+            (app_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def relay_log_by_group_msg(app_id: int, group_msg_id: int) -> dict | None:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        return _relay_row(db.execute(
+            "SELECT * FROM relay_log WHERE app_id = ? AND group_msg_id = ? ORDER BY id DESC LIMIT 1",
+            (app_id, group_msg_id),
+        ).fetchone())
+
+
+def relay_log_for_app(app_id: int) -> list[dict]:
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT * FROM relay_log WHERE app_id = ? ORDER BY id", (app_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def latest_application(user_id: int) -> dict | None:
+    """Последняя заявка человека в любом статусе."""
+    with closing(connect()) as db:
+        db.row_factory = sqlite3.Row
+        return _relay_row(db.execute(
+            "SELECT id, user_id, name, COALESCE(status, 'new') AS status, assigned_to"
+            " FROM applications WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
+        ).fetchone())
+
+
+def open_assigned_app_ids() -> list[int]:
+    with closing(connect()) as db:
+        rows = db.execute(
+            f"SELECT id FROM applications WHERE assigned_to IS NOT NULL"
+            f" AND status IN ({_marks(OPEN_STATUSES)}) ORDER BY id", OPEN_STATUSES
+        ).fetchall()
+    return [r[0] for r in rows]

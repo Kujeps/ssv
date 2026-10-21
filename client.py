@@ -22,6 +22,7 @@ from form import (
 )
 from notify import notify_admins, notify_moderators_queue, refresh_cards, send_lead_cards
 from quick import TEXTS as QUICK_TEXTS, begin_quick, say
+from relay import from_client as relay_from_client
 from reminders import OPTOUT_DONE
 from ui import (
     apply_keyboard, confirm_keyboard, pending_notice, phone_keyboard, step_keyboard,
@@ -316,6 +317,8 @@ async def on_step_other(message: Message) -> None:
 
 @client.message()
 async def on_anything(message: Message, bot: Bot) -> None:
+    if await relay_from_client(bot, message):  # менеджер уже переписывается с клиентом в теме
+        return
     pending = active_application(message.from_user.id)
     if pending:
         text = (message.text or "").strip()

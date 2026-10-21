@@ -53,7 +53,8 @@ class World:
                     self.n += 1
                     world.last[method.chat_id] = self.n
                     world.sent.append(dict(chat=method.chat_id, text=method.text, kb=method.reply_markup,
-                                           reply=getattr(method, "reply_parameters", None), id=self.n))
+                                           reply=getattr(method, "reply_parameters", None), id=self.n,
+                                           thread=getattr(method, "message_thread_id", None)))
                     return method.__returning__.model_validate({
                         "message_id": self.n, "date": 0, "text": method.text,
                         "chat": {"id": method.chat_id, "type": "private"}}, context={"bot": bot})
@@ -81,6 +82,19 @@ class World:
                 if name == "SendChatAction":
                     world.actions.append((method.chat_id, str(method.action)))
                     return True
+                if name == "CreateForumTopic":
+                    self.n += 1
+                    world.calls.append((name, method))
+                    return method.__returning__.model_validate(
+                        {"message_thread_id": self.n, "name": method.name, "icon_color": 0})
+                if name == "CopyMessage":
+                    self.n += 1
+                    world.calls.append((name, method))
+                    return method.__returning__.model_validate({"message_id": self.n})
+                if name in ("SetMessageReaction", "CloseForumTopic", "ReopenForumTopic", "PinChatMessage",
+                            "EditMessageCaption"):
+                    world.calls.append((name, method))
+                    return True
                 if name in ("SetMyCommands", "DeleteMyCommands"):
                     world.commands.append((name, getattr(method, "scope", None)))
                     return True
@@ -88,6 +102,7 @@ class World:
 
         self.sent, self.edits, self.markups, self.deleted = [], [], [], []
         self.answers, self.docs, self.commands, self.actions = [], [], [], []
+        self.calls = []
         self.last, self.forbidden = {}, set()
         self.n = 0
         self.session = Fake()
@@ -126,6 +141,39 @@ class World:
             "id": str(self.n), "from": self.user(uid, name), "chat_instance": "x", "data": data,
             "message": {"message_id": mid or self.with_kb(uid), "date": 0,
                         "chat": {"id": uid, "type": "private"}, "text": "x"}})
+
+    # --- группа с темами и вложения ---
+    async def gmsg(self, uid, chat, thread, text=None, edit=False, **fields):
+        self.n += 1
+        m = {"message_id": 9000 + self.n if "message_id" not in fields else fields.pop("message_id"), "date": 0,
+             "chat": {"id": chat, "type": "supergroup", "is_forum": True, "title": "g"},
+             "from": self.user(uid), "message_thread_id": thread, "is_topic_message": True, **fields}
+        if text is not None:
+            m["text"] = text
+        await self.feed(**({"edited_message": m} if edit else {"message": m}))
+        return m["message_id"]
+
+    async def gpress(self, uid, chat, thread, data, mid):
+        self.answers.clear()
+        self.n += 1
+        await self.feed(callback_query={
+            "id": str(self.n), "from": self.user(uid), "chat_instance": "x", "data": data,
+            "message": {"message_id": mid, "date": 0, "message_thread_id": thread, "is_topic_message": True,
+                        "chat": {"id": chat, "type": "supergroup", "is_forum": True, "title": "g"}, "text": "x"}})
+
+    async def media(self, uid, kind="photo", caption=None):
+        """Клиент присылает вложение в личку."""
+        self.n += 1
+        body = {"photo": {"photo": [{"file_id": "ph", "file_unique_id": "u", "width": 9, "height": 9}]},
+                "voice": {"voice": {"file_id": "vo", "file_unique_id": "u", "duration": 1}},
+                "sticker": {"sticker": {"file_id": "st", "file_unique_id": "u", "type": "regular", "width": 9,
+                                        "height": 9, "is_animated": False, "is_video": False}}}[kind]
+        m = {"message_id": 9000 + self.n, "date": 0, "chat": {"id": uid, "type": "private"},
+             "from": self.user(uid), **body}
+        if caption:
+            m["caption"] = caption
+        await self.feed(message=m)
+        return m["message_id"]
 
     # --- наблюдение ---
     def to(self, chat):
