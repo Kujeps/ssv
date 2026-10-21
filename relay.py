@@ -29,7 +29,7 @@ from config import AUTO_REPLY_EVERY_HOURS, CALLBACK_OPTIONS, MSK, NOCALL_ALERT_A
 from config import REASON_REQUIRED, STATUSES, WORK_HOURS_MSK
 from db import (
     add_note, callback_time, change_status, finish_lead, get_application, latest_application, manager_display_name,
-    mark_blocked, postpone_lead, taken_without_topic, release_lead, relay_chat_id, relay_log_add,
+    get_setting, mark_blocked, open_without_topic, postpone_lead, taken_without_topic, release_lead, relay_chat_id, relay_log_add,
     relay_log_by_group_msg, relay_log_pending, relay_log_set, relay_topic, relay_topic_by_thread,
     relay_topic_delete, relay_topic_save, relay_topic_update, set_setting,
 )
@@ -294,10 +294,18 @@ async def retry_topics(bot: Bot) -> None:
     """Фоновая попытка создать темы для только что взятых заявок (если раньше мешал лимит Telegram)."""
     if not relay_chat_id() or time.time() < _flood_until:
         return
-    for app_id in taken_without_topic(3):
+    ids = taken_without_topic(3)
+    backfill = get_setting("relay_backfill") == "1"
+    if backfill:
+        ids += [i for i in open_without_topic(3) if i not in ids][: max(0, 3 - len(ids))]
+    for app_id in ids:
         await sync_topic(bot, app_id)
         if time.time() < _flood_until:
-            break
+            return
+    if backfill and not open_without_topic(1):
+        set_setting("relay_backfill", "0")
+        from notify import notify_admins
+        await notify_admins(bot, "✅ Темы для всех открытых заявок созданы.")
 
 
 def _auto_reply_due(topic: dict) -> bool:
@@ -539,11 +547,31 @@ async def on_relay_here(message: Message, bot: Bot) -> None:
         "менеджер возьмёт новую заявку или клиент по старой напишет.")
 
 
+@setup.message(Command("relay_sync"))
+async def on_relay_sync(message: Message) -> None:
+    """Постепенно создаёт темы для всех открытых заявок, взятых до подключения группы."""
+    if message.from_user is None or not is_admin(message.from_user.id):
+        return
+    if not relay_chat_id():
+        await message.answer("Сначала подключите группу: отправьте /relay_here в группе с темами.")
+        return
+    total = len(open_without_topic())
+    if not total:
+        await message.answer("Все открытые заявки уже в темах — создавать нечего.")
+        return
+    set_setting("relay_backfill", "1")
+    minutes = max(1, -(-total // 6))
+    await message.answer(
+        f"🔄 Создаю темы для открытых заявок: <b>{total}</b>. Бот делает это постепенно — по 3 каждые 30 секунд "
+        f"(лимит Telegram), примерно {minutes} мин. Когда закончу, напишу. Остановить: /relay_off.")
+
+
 @setup.message(Command("relay_off"))
 async def on_relay_off(message: Message) -> None:
     if message.from_user is None or not is_admin(message.from_user.id):
         return
     set_setting("relay_chat", "0")
+    set_setting("relay_backfill", "0")
     await message.answer("Переписка через группу отключена. Существующие темы остаются, но бот их больше не обслуживает.")
 
 

@@ -1564,6 +1564,22 @@ def taken_without_topic(limit: int = 3) -> list[int]:
     return [r[0] for r in rows]
 
 
+def open_without_topic(limit: int | None = None) -> list[int]:
+    """Все заявки у менеджеров (в работе, ждут перезвона), для которых нет темы в текущей группе."""
+    chat = relay_chat_id()
+    sql = (
+        "SELECT a.id FROM applications a LEFT JOIN relay_topics t ON t.app_id = a.id AND t.chat_id = ?"
+        f" WHERE a.assigned_to IS NOT NULL AND a.status IN ({_marks(OPEN_STATUSES)}) AND t.app_id IS NULL"
+        " ORDER BY a.id"
+    )
+    args: list = [chat or 0, *OPEN_STATUSES]
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    with closing(connect()) as db:
+        return [r[0] for r in db.execute(sql, args).fetchall()]
+
+
 def open_assigned_app_ids() -> list[int]:
     with closing(connect()) as db:
         rows = db.execute(

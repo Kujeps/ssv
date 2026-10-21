@@ -147,12 +147,28 @@ async def main():
     assert con().execute("SELECT blocked_at FROM funnel WHERE user_id=31").fetchone()[0]; ok("клиент отмечен заблокировавшим")
     w.forbidden.clear()
 
+    # ---------- постепенное создание тем для старых заявок ----------
+    for uid in (71, 72, 73, 74):   # четыре заявки «в работе», взятые «до подключения»: темы нет
+        await w.msg(uid, "/start"); await w.press(uid, "qm:call"); await w.msg(uid, f"+7 900 000-00-{uid}")
+    c = con(); ids = [r[0] for r in c.execute("SELECT id FROM applications WHERE user_id IN (71,72,73,74) ORDER BY id")]
+    c.execute(f"UPDATE applications SET status='reached', assigned_to=50, assigned_name='Иван' WHERE id IN ({','.join(map(str, ids))})"); c.commit(); c.close()
+    assert len(D.open_without_topic()) >= 4; ok("есть открытые заявки без тем")
+    await w.msg(50, "/relay_sync"); assert D.get_setting("relay_backfill") != "1"; ok("/relay_sync от не-админа игнорируется")
+    await w.msg(1, "/relay_sync"); assert "Создаю темы" in w.last_to(1)["text"] and "по 3 каждые 30 секунд" in w.last_to(1)["text"]; ok("/relay_sync: сообщает, сколько тем и как быстро")
+    before = len(calls("CreateForumTopic"))
+    await R.retry_topics(w.bot); made = len(calls("CreateForumTopic")) - before
+    assert made == 3; ok("за одну проверку создаётся не больше 3 тем (лимит Telegram)")
+    await R.retry_topics(w.bot); await R.retry_topics(w.bot)
+    assert D.open_without_topic() == [] ; ok("через несколько проверок темы есть у всех открытых заявок")
+    assert D.get_setting("relay_backfill") == "0" and any("Темы для всех открытых заявок созданы" in (s["text"] or "") for s in w.to(1)); ok("по окончании админ получает «готово», режим выключается")
+    await w.msg(1, "/relay_sync"); assert "уже в темах" in w.last_to(1)["text"]; ok("повторный /relay_sync: создавать нечего")
+
     # ---------- группа отключена ----------
     await w.msg(1, "/relay_off"); await w.gmsg(1, G, None, "/relay_off")
     assert D.relay_chat_id() is None; ok("/relay_off отключает переписку")
     await w.msg(41, "/start"); await w.press(41, "qm:call"); await w.msg(41, "+7 900 111-22-33")
     w.clear(); await w.msg(41, "Хочу служить в десанте, есть опыт")
     assert not w.to(G); ok("без группы бот работает по-старому: в группу ничего не пишется")
-    assert "десанте" in (D.get_application(3)["comment"] or ""); ok("сообщение клиента ушло в комментарий заявки, как раньше")
+    assert "десанте" in (D.get_application(D.latest_application(41)["id"])["comment"] or ""); ok("сообщение клиента ушло в комментарий заявки, как раньше")
     print("\nПЕРЕПИСКА ЧЕРЕЗ ГРУППУ — ВСЁ ПРОШЛО")
 run(main())
