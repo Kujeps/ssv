@@ -766,6 +766,28 @@ def admin_requeue(app_id: int, admin_id: int, admin_name: str) -> tuple[bool, in
     return True, row[1]
 
 
+def requeue_candidates(filters: dict) -> list[int]:
+    """Заявки по фильтру архива, которые можно вернуть в очередь (все, кроме уже новых)."""
+    where, args = _archive_where(filters, None)
+    where = (where + " AND " if where else " WHERE ") + "COALESCE(a.status, 'new') <> 'new'"
+    with closing(connect()) as db:
+        return [r[0] for r in db.execute(f"SELECT a.id FROM applications a{where} ORDER BY a.id", args)]
+
+
+def admin_requeue_many(app_ids: list[int], admin_id: int, admin_name: str) -> list[tuple[int, int | None]]:
+    """Массовый возврат в очередь (для повторной обработки). Возвращает [(заявка, прежний модератор)]."""
+    done = []
+    with closing(connect()) as db, db:
+        for app_id in app_ids:
+            row = db.execute(
+                "SELECT COALESCE(status, 'new'), assigned_to FROM applications WHERE id = ?", (app_id,)
+            ).fetchone()
+            if row and row[0] != "new":
+                _requeue(db, app_id, admin_id, admin_name, "admin", row[1])
+                done.append((app_id, row[1]))
+    return done
+
+
 # ---------- фоновые проверки ----------
 
 def expired_holds(now: datetime | None = None) -> list[tuple[int, int]]:

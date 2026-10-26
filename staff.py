@@ -29,7 +29,7 @@ from config import (
     PER_PAGE, REASON_REQUIRED, STATUSES,
 )
 from db import (
-    active_lead, add_moderator, add_note, admin_requeue, archive_moderators, archive_page,
+    active_lead, add_moderator, add_note, admin_requeue, admin_requeue_many, requeue_candidates, archive_moderators, archive_page,
     build_export_xlsx, change_status, create_source, finish_lead, get_application, get_broadcast_recipients,
     get_edits, get_history, get_stats, list_moderators, list_sources, mark_blocked,
     moderator_stats, parked_leads, postpone_lead, release_lead, remove_moderator,
@@ -705,6 +705,7 @@ def archive_view(user_id: int, arch: dict) -> tuple[str, InlineKeyboardMarkup]:
     keyboard.append([btn("🔍 Поиск", "ar:q"), btn("♻️ Сбросить", "ar:reset")])
     if admin and total:
         keyboard.append([btn("📤 Excel по фильтру", "ar:x")])
+        keyboard.append([btn("♻️ Вернуть в очередь по фильтру", "ar:rq")])
     keyboard.append([btn("🏠 Меню", "mp:menu")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -899,6 +900,48 @@ async def on_archive_open_card(cb: CallbackQuery, state: FSMContext) -> None:
     rows.append([btn("⬅️ К списку", "ar:b")])
     with suppress(TelegramBadRequest):
         await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@staff.callback_query(F.data == "ar:rq", IsAdmin())
+async def on_archive_requeue(cb: CallbackQuery, state: FSMContext) -> None:
+    """Повторная обработка: все заявки по текущему фильтру архива — обратно в очередь."""
+    arch = await get_arch(state)
+    ids = requeue_candidates(arch["filters"])
+    if not ids:
+        await cb.answer("По этому фильтру вернуть нечего: заявки уже в очереди", show_alert=True)
+        return
+    await cb.answer()
+    warn = "" if arch["filters"] else "\n\n⚠️ <b>Фильтры не заданы — вернутся ВСЕ обработанные заявки.</b>"
+    await cb.message.answer(
+        f"♻️ <b>Вернуть в очередь {len(ids)} заявок?</b>\n\nФильтры: {filters_text(arch['filters'])}{warn}\n\n"
+        "Они станут «Новыми» и будут выдаваться модераторам заново (самые старые — первыми). "
+        "Заметки и история заявок сохранятся. Заявки, которые сейчас в работе у менеджеров, тоже вернутся.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn(f"✅ Вернуть {len(ids)}", "ar:rqok")], [btn("↩️ Отмена", "ar:b")],
+        ]),
+    )
+
+
+@staff.callback_query(F.data == "ar:rqok", IsAdmin())
+async def on_archive_requeue_ok(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    arch = await get_arch(state)
+    done = admin_requeue_many(requeue_candidates(arch["filters"]), cb.from_user.id, cb.from_user.full_name)
+    await cb.answer(f"Возвращено: {len(done)}")
+    with suppress(TelegramBadRequest):
+        await cb.message.edit_reply_markup(reply_markup=None)
+    holders: dict[int, int] = {}
+    for app_id, holder in done:
+        await refresh_cards(bot, app_id)
+        if holder:
+            holders[holder] = holders.get(holder, 0) + 1
+        await asyncio.sleep(0.05)  # не упираемся в лимиты Telegram на правку сообщений
+    for holder, n in holders.items():
+        if holder != cb.from_user.id:
+            with suppress(Exception):
+                await bot.send_message(holder, f"♻️ Администратор вернул в очередь ваши заявки ({n}) для повторной обработки.")
+    await cb.message.answer(f"♻️ Возвращено в очередь: <b>{len(done)}</b>. Модераторы получат их при «Взять заявку».")
+    if done:
+        await notify_moderators_queue(bot, f"♻️ В очередь вернулись заявки для повторной обработки: {len(done)}")
 
 
 @staff.callback_query(F.data == "noop", IsStaff())
