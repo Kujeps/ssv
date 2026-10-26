@@ -41,6 +41,7 @@ from form import STEP_STATES, Form
 from notify import notify_admins, notify_moderators_queue, refresh_cards
 from reminders import pending_counts, staff_ids
 from roles import IsAdmin, IsModerator, IsStaff, is_admin
+from db import is_moderator
 from ui import (
     admin_panel, broadcast_confirm_keyboard, btn, lead_keyboard, lead_text, mod_panel,
 )
@@ -642,6 +643,7 @@ HISTORY_LABELS = {
     "release": "вернул в очередь", "timeout": "автовозврат: время вышло",
     "cb_timeout": "автовозврат: перезвон просрочен", "admin": "вернул админ",
     "remove_mod": "модератор убран → в очередь", "migrate": "перенесена в очередь",
+    "transfer": "передал заявку другому менеджеру",
 }
 
 
@@ -941,6 +943,45 @@ async def on_start_notify_toggle(cb: CallbackQuery, bot: Bot) -> None:
     on = not start_notify_enabled()
     set_setting("start_notify", "1" if on else "0")
     await cb.answer("🚀 Уведомления о запусках " + ("включены" if on else "выключены"))
+    await send_panel(bot, cb.message.chat.id, cb.from_user.id)
+
+
+@staff.callback_query(F.data == "ap:self", IsAdmin())
+async def on_admin_self(cb: CallbackQuery, bot: Bot) -> None:
+    """Админ сам берёт заявки: для этого он становится и модератором (и может выйти обратно)."""
+    user = cb.from_user
+    if not is_moderator(user.id):
+        add_moderator(user.id, user.full_name, user.username, user.id)
+        await cb.answer("👷 Теперь вы можете брать заявки")
+        await send_panel(bot, cb.message.chat.id, user.id)
+        return
+    e = next((x for x in moderator_stats() if x["user_id"] == user.id), {})
+    open_leads = (1 if e.get("active") else 0) + e.get("parked", 0)
+    if open_leads:
+        await cb.answer()
+        await cb.message.answer(
+            f"У вас <b>{open_leads}</b> заявок в работе. Если перестать брать заявки, они вернутся в очередь "
+            "(или сначала передайте их другому менеджеру кнопкой «🔀 Передать»).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [btn("✅ Перестать и вернуть в очередь", "ap:selfoff")], [btn("↩️ Отмена", "mp:menu")],
+            ]),
+        )
+        return
+    remove_moderator(user.id)
+    await cb.answer("Вы больше не берёте заявки")
+    await send_panel(bot, cb.message.chat.id, user.id)
+
+
+@staff.callback_query(F.data == "ap:selfoff", IsAdmin())
+async def on_admin_self_off(cb: CallbackQuery, bot: Bot) -> None:
+    returned = remove_moderator(cb.from_user.id)
+    await cb.answer("Вы больше не берёте заявки")
+    with suppress(TelegramBadRequest):
+        await cb.message.edit_reply_markup(reply_markup=None)
+    for app_id in returned:
+        await refresh_cards(bot, app_id)
+    if returned:
+        await notify_moderators_queue(bot, "↩️ Заявки вернулись в очередь")
     await send_panel(bot, cb.message.chat.id, cb.from_user.id)
 
 

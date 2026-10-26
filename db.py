@@ -513,6 +513,40 @@ def remove_moderator(user_id: int) -> list[int]:
     return [r[0] for r in rows]
 
 
+def transfer_lead(app_id: int, by_id: int, by_name: str, to_id: int, to_name: str,
+                  note: str | None = None, force: bool = False) -> dict | None:
+    """Передача заявки другому менеджеру (например, после первичного опроса — более опытному).
+    Только что взятая заявка («Взята») приходит получателю как «В работе» — без часового таймера, чтобы
+    не мешать ему брать заявки из очереди; «Не дозвонились» и «Перезвонить» сохраняют время перезвона.
+    force — передаёт админ (заявка может быть не его). None — передать нельзя."""
+    with closing(connect()) as db, db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT COALESCE(status, 'new') AS status, assigned_to, assigned_name FROM applications WHERE id = ?",
+            (app_id,),
+        ).fetchone()
+        if not row or row["status"] not in OPEN_STATUSES or row["assigned_to"] is None:
+            return None
+        if (not force and row["assigned_to"] != by_id) or row["assigned_to"] == to_id:
+            return None
+        if not db.execute("SELECT 1 FROM moderators WHERE user_id = ?", (to_id,)).fetchone():
+            return None
+        status = "reached" if row["status"] == "work" else row["status"]
+        db.execute(
+            "UPDATE applications SET assigned_to = ?, assigned_name = ?, assigned_at = CURRENT_TIMESTAMP,"
+            " status = ?, taken_at = NULL, warned = 0, cb_notified = 0,"
+            " status_by = ?, status_by_id = ?, status_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (to_id, to_name, status, by_name, by_id, app_id),
+        )
+        _log(db, app_id, status, by_id, by_name, "transfer", to_id)
+        text = f"🔀 Передал → {to_name}" + (f": {note}" if note else "")
+        db.execute(
+            "INSERT INTO lead_notes (app_id, by_id, by_name, text) VALUES (?, ?, ?, ?)",
+            (app_id, by_id, by_name, text),
+        )
+    return {"from_id": row["assigned_to"], "from_name": row["assigned_name"], "status": status}
+
+
 def is_moderator(user_id: int) -> bool:
     with closing(connect()) as db:
         return db.execute("SELECT 1 FROM moderators WHERE user_id = ?", (user_id,)).fetchone() is not None

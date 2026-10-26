@@ -103,6 +103,7 @@ def card_keyboard(app: dict) -> InlineKeyboardMarkup | None:
         [btn("✅ Согласился", f"rt:{i}:agreed"), btn("❌ Отказался", f"rt:{i}:refused")],
         [btn("⏳ В работе", f"rt:{i}:reached"), btn("📵 Не дозвонился", f"rt:{i}:nocall")],
         [btn("🗑 Мусор", f"rt:{i}:junk"), btn("↩️ Вернуть в очередь", f"rt:{i}:release")],
+        [btn("🔀 Передать другому менеджеру", f"rt:{i}:tr")],
     ])
 
 
@@ -181,6 +182,13 @@ async def _sync(bot: Bot, chat: int, app_id: int) -> None:
         with suppress(TelegramBadRequest):
             await bot.close_forum_topic(chat, topic["thread_id"])
         relay_topic_update(app_id, closed=1)
+
+
+async def post_in_topic(bot: Bot, app_id: int, text: str) -> None:
+    """Служебная запись в тему заявки (если тема есть)."""
+    topic = relay_topic(app_id)
+    if topic and relay_chat_id() == topic["chat_id"]:
+        await _say(bot, topic, text)
 
 
 async def _say(bot: Bot, topic: dict, text: str) -> None:
@@ -447,7 +455,9 @@ async def on_topic_button(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Нет доступа", show_alert=True)
         return
     app = get_application(app_id)
-    if not owned(app, user.id):
+    from transfer import can_transfer
+    allowed = can_transfer(app, user.id) if act in ("tr", "to", "tg") else owned(app, user.id)
+    if not allowed:
         await cb.answer("Эта заявка не закреплена за вами", show_alert=True)
         return
     topic = relay_topic(app_id)
@@ -491,6 +501,42 @@ async def on_topic_button(cb: CallbackQuery, bot: Bot) -> None:
             cb.message.chat.id, ACTION_PROMPTS[act], message_thread_id=thread,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("↩️ Отмена", f"rt:{app_id}:x")]]),
         )
+    elif act == "tr":  # кому передать
+        from transfer import pick_rows
+        rows = pick_rows(app, f"rt:{app_id}:to:")
+        if not rows:
+            await cb.answer("Передать некому: других модераторов нет.", show_alert=True)
+            return
+        await cb.answer()
+        rows.append([btn("⬅️ Назад", f"rt:{app_id}:back")])
+        with suppress(TelegramBadRequest):
+            await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    elif act == "to":  # получатель выбран — ждём комментарий «что уже выяснили»
+        from transfer import NOTE_PROMPT, list_moderators, mod_name
+        to = next((m for m in list_moderators() if m["user_id"] == int(parts[3])), None)
+        if to is None:
+            await cb.answer("Этого менеджера уже нет", show_alert=True)
+            return
+        await cb.answer()
+        PENDING[key] = (f"transfer:{to['user_id']}", app_id)
+        with suppress(TelegramBadRequest):
+            await cb.message.edit_reply_markup(reply_markup=card_keyboard(app))
+        await bot.send_message(
+            cb.message.chat.id,
+            NOTE_PROMPT.format(id=app_id, name=escape(mod_name(to))).replace("Напишите,", "Напишите следующим сообщением в теме,"),
+            message_thread_id=thread,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [btn("➡️ Передать без комментария", f"rt:{app_id}:tg:{to['user_id']}")],
+                [btn("↩️ Отмена", f"rt:{app_id}:x")],
+            ]),
+        )
+    elif act == "tg":  # передать без комментария
+        PENDING.pop(key, None)
+        from transfer import do_transfer
+        name = await do_transfer(bot, app_id, user, int(parts[3]), None)
+        await cb.answer(f"🔀 Передано: {name}" if name else "Передать не получилось", show_alert=not name)
+        with suppress(TelegramBadRequest):
+            await cb.message.delete()
     elif act == "x":
         PENDING.pop(key, None)
         await cb.answer("Отменено")
@@ -508,6 +554,14 @@ async def finish_pending(bot: Bot, message: Message, key: tuple, app: dict) -> N
         await message.reply("Напишите хотя бы пару слов.")
         return
     PENDING.pop(key, None)
+    if kind.startswith("transfer:"):
+        from transfer import do_transfer
+        name = await do_transfer(bot, app_id, user, int(kind.split(":")[1]), text)
+        if name:
+            await react(bot, message)
+        else:
+            await message.reply("Передать не получилось: заявка уже не у вас или менеджер недоступен.")
+        return
     app = get_application(app_id)
     if not owned(app, user.id):
         await message.reply("Эта заявка уже не закреплена за вами.")

@@ -49,7 +49,7 @@ async def main():
     # --- экран редактирования ---
     await w.press(50, "tb:v:all:0", mid=scr)
     await w.press(50, f"tb:e:{work_id}", mid=scr); e = w.edits[-1]
-    assert "Что изменить?" in e["text"] and f"Заявка #{work_id}" in e["text"] and set(w.datas(e["kb"])) == {f"tb:s:{work_id}", f"tb:c:{work_id}", f"tb:x:{work_id}", f"tb:d:{work_id}", "tb:b"}; ok("тап по заявке: полная карточка и кнопки «Статус / Комментарий / Доп. информация / Данные клиента»")
+    assert "Что изменить?" in e["text"] and f"Заявка #{work_id}" in e["text"] and set(w.datas(e["kb"])) == {f"tb:s:{work_id}", f"tb:c:{work_id}", f"tb:x:{work_id}", f"tb:d:{work_id}", f"tr:{work_id}", "tb:b"}; ok("тап по заявке: полная карточка и кнопки «Статус / Комментарий / Доп. информация / Данные клиента / Передать»")
     w.clear(); await w.press(50, f"tb:e:{foreign}", mid=scr); assert w.answers[-1] == ("Эта заявка уже не закреплена за вами", True); ok("чужую заявку редактировать нельзя")
 
     # --- быстрый комментарий одной кнопкой ---

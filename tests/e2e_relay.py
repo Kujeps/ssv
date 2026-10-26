@@ -45,7 +45,7 @@ async def main():
     t = calls("CreateForumTopic"); assert len(t) == 1 and t[0].name.startswith("#1 U21"), t; ok("взял заявку → создана тема «#1 U21»")
     card = [s for s in w.sent if s["chat"] == G and s["thread"] and "Заявка #1" in (s["text"] or "")][0]
     assert "+79991234567" in card["text"] and "Менеджер Иван" in card["text"] and "Имя для клиентов" in card["text"]; ok("первое сообщение темы — карточка клиента и подсказка про подпись и кнопку смены имени")
-    assert w.datas(card["kb"]) == ["rt:1:agreed", "rt:1:refused", "rt:1:reached", "rt:1:nocall", "rt:1:junk", "rt:1:release"]; ok("под карточкой кнопки статусов")
+    assert w.datas(card["kb"]) == ["rt:1:agreed", "rt:1:refused", "rt:1:reached", "rt:1:nocall", "rt:1:junk", "rt:1:release", "rt:1:tr"]; ok("под карточкой кнопки статусов и «Передать»")
     assert calls("PinChatMessage"); ok("карточка закреплена в теме")
     cp = calls("CopyMessage"); assert len(cp) == 1 and cp[0].chat_id == G and "мой паспорт" in cp[0].caption and "👤" in cp[0].caption; ok("вложение, присланное до взятия, перенесено в тему с пометкой клиента")
     assert any("до того, как заявку взяли" in (s["text"] or "") for s in w.sent if s["chat"] == G); ok("с пояснением, что это было до взятия")

@@ -20,7 +20,8 @@ from aiogram.types import (
 )
 
 from config import (
-    CALLBACK_OPTIONS, CHOICES, EDIT_FIELDS, LOCAL_TZ, NOCALL_ALERT_ATTEMPTS, QUICK_COMMENTS, STATUSES,
+    CALLBACK_OPTIONS, CHOICES, EDIT_FIELDS, LOCAL_TZ, NOCALL_ALERT_ATTEMPTS, OPEN_STATUSES, QUICK_COMMENTS,
+    STATUSES,
 )
 from db import (
     add_note, build_table_xlsx, callback_time, change_status, delete_last_note, get_application,
@@ -171,6 +172,7 @@ def edit_markup(app: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn("📊 Статус", f"tb:s:{i}"), btn("💬 Комментарий", f"tb:c:{i}")],
         [btn("ℹ️ Доп. информация", f"tb:x:{i}"), btn("✏️ Данные клиента", f"tb:d:{i}")],
+        *([[btn("🔀 Передать другому менеджеру", f"tr:{i}")]] if app["status"] in OPEN_STATUSES else []),
         [btn("⬅️ К таблице", "tb:b")],
     ])
 

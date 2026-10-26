@@ -213,7 +213,10 @@ def lead_keyboard(app: dict, view: str = "admin", viewer_id: int | None = None):
     if view == "admin":
         if status == "new":
             return None
-        return InlineKeyboardMarkup(inline_keyboard=[[btn("↩️ Вернуть в очередь", f"ad:{app_id}:requeue")]])
+        rows = [[btn("↩️ Вернуть в очередь", f"ad:{app_id}:requeue")]]
+        if status in OPEN_STATUSES and app["assigned_to"]:
+            rows[0].append(btn("🔀 Передать", f"tr:{app_id}"))
+        return InlineKeyboardMarkup(inline_keyboard=rows)
     if app["assigned_to"] != viewer_id:
         return InlineKeyboardMarkup(inline_keyboard=[[menu]])
     if status == "work":
@@ -222,12 +225,13 @@ def lead_keyboard(app: dict, view: str = "admin", viewer_id: int | None = None):
             [btn("⏳ В работе", f"mv:{app_id}:reached"), btn("📵 Не дозвонился", f"mv:{app_id}:nocall")],
             [btn("🗑 Мусор", f"mv:{app_id}:junk"), btn("✍️ Заметка", f"mv:{app_id}:note")],
             [btn("✏️ Изменить", f"tb:n:{app_id}"), btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
+            [btn("🔀 Передать другому менеджеру", f"tr:{app_id}")],
         ])
     if status in OPEN_STATUSES:  # в ожидании: «В работе» / «Не дозвонились» / «Перезвонить»
         return InlineKeyboardMarkup(inline_keyboard=[
             [btn("📞 Позвонить сейчас", f"mt:{app_id}")],
             [btn("✏️ Изменить", f"tb:n:{app_id}"), btn("✍️ Заметка", f"mv:{app_id}:note")],
-            [btn("↩️ Вернуть в очередь", f"mv:{app_id}:release")],
+            [btn("↩️ Вернуть в очередь", f"mv:{app_id}:release"), btn("🔀 Передать", f"tr:{app_id}")],
             [menu],
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -290,7 +294,10 @@ def admin_panel(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
         active = active_lead(admin_id)
         rows.append([btn(f"📂 Моя заявка #{active['id']}", "mp:active")] if active
                     else [btn("📥 Взять заявку", "mp:take")])
-        rows.append([btn("📋 Моя таблица", "tb:open")])
+        rows.append([btn("📋 Моя таблица", "tb:open"), btn(f"🔁 В ожидании ({len(parked_leads(admin_id))})", "mp:cb")])
+        rows.append([btn("👷 Беру заявки сам: ВКЛ", "ap:self")])
+    else:
+        rows.append([btn("👷 Брать заявки самому", "ap:self")])
     rows.append([btn("✏️ Имя для клиентов", "nm:open")])
     rows.append([btn("📝 Подать заявку (проверка формы)", "apply")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
