@@ -547,6 +547,31 @@ def transfer_lead(app_id: int, by_id: int, by_name: str, to_id: int, to_name: st
     return {"from_id": row["assigned_to"], "from_name": row["assigned_name"], "status": status}
 
 
+def claim_lead(app_id: int, user_id: int, name: str, take_over: bool = False) -> dict | None:
+    """Менеджер написал в теме заявки — заявка закрепляется за ним как «В работе» (без часового таймера).
+    Можно забрать заявку из очереди и уже обработанную (повторная обработка); чужую взятую — только с take_over (админ).
+    Возвращает {'prev_holder', 'prev_status'} или None, если забрать нельзя (или она уже его)."""
+    with closing(connect()) as db, db:
+        row = db.execute(
+            "SELECT COALESCE(status, 'new'), assigned_to FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if not row:
+            return None
+        status, holder = row
+        if status in OPEN_STATUSES and holder == user_id:
+            return None  # уже его
+        if status in OPEN_STATUSES and holder is not None and not take_over:
+            return None  # в работе у другого менеджера
+        db.execute(
+            "UPDATE applications SET status = 'reached', assigned_to = ?, assigned_name = ?,"
+            " assigned_at = CURRENT_TIMESTAMP, taken_at = NULL, warned = 0, callback_at = NULL, cb_notified = 0,"
+            " status_by = ?, status_by_id = ?, status_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (user_id, name, name, user_id, app_id),
+        )
+        _log(db, app_id, "reached", user_id, name, "take", user_id)
+    return {"prev_holder": holder if holder != user_id else None, "prev_status": status}
+
+
 def is_moderator(user_id: int) -> bool:
     with closing(connect()) as db:
         return db.execute("SELECT 1 FROM moderators WHERE user_id = ?", (user_id,)).fetchone() is not None

@@ -28,7 +28,7 @@ import config
 from config import AUTO_REPLY_EVERY_HOURS, CALLBACK_OPTIONS, MSK, NOCALL_ALERT_ATTEMPTS, OPEN_STATUSES
 from config import REASON_REQUIRED, STATUSES, WORK_HOURS_MSK
 from db import (
-    add_note, callback_time, change_status, finish_lead, get_application, latest_application, manager_display_name,
+    add_moderator, add_note, callback_time, change_status, claim_lead, is_moderator, finish_lead, get_application, latest_application, manager_display_name,
     get_setting, mark_blocked, open_without_topic, postpone_lead, taken_without_topic, release_lead, relay_chat_id, relay_log_add,
     relay_log_by_group_msg, relay_log_pending, relay_log_set, relay_topic, relay_topic_by_thread,
     relay_topic_delete, relay_topic_save, relay_topic_update, set_setting,
@@ -171,6 +171,7 @@ async def _sync(bot: Bot, chat: int, app_id: int) -> None:
                 await bot.reopen_forum_topic(chat, topic["thread_id"])
             relay_topic_update(app_id, closed=0)
             await _say(bot, topic, f"👷 Заявку взял: <b>{escape(app['assigned_name'] or '—')}</b>")
+            await _replay_pending(bot, chat, topic["thread_id"], app)  # что клиент прислал, пока заявка была в очереди
     await _update_card(bot, topic, app)
     if topic and not active and not topic["closed"]:
         icon, label = STATUSES.get(app["status"], STATUSES["new"])
@@ -374,9 +375,10 @@ async def on_manager_message(message: Message, bot: Bot) -> None:
             await refresh_cards(bot, app["id"])
             await react(bot, message, "✍")
         return
-    if not (is_admin(user.id) or app["assigned_to"] == user.id):
-        await message.reply("Эта заявка закреплена за другим менеджером — клиенту не отправлено.")
-        return
+    if not (app["assigned_to"] == user.id and app["status"] in OPEN_STATUSES):
+        app = await claim_by_writing(bot, message, app)
+        if app is None:
+            return
     name = manager_display_name(user.id, user.full_name)
     label = f"<b>Менеджер {escape(name)}:</b>"
     log_id = relay_log_add(app["id"], "out", kind, text or caption, file_id_of(message), message.message_id,
@@ -416,6 +418,30 @@ async def on_manager_edit(message: Message, bot: Bot) -> None:
         elif message.caption and row["kind"] in CAPTION_KINDS:
             await bot.edit_message_caption(chat_id=app["user_id"], message_id=row["client_msg_id"],
                                            caption=f"{label}\n{escape(message.caption)}"[:1000])
+
+
+async def claim_by_writing(bot: Bot, message: Message, app: dict) -> dict | None:
+    """Написал в теме чужой/свободной/закрытой заявки — заявка становится твоей («В работе»).
+    Модератор забирает заявку из очереди или уже обработанную; заявку в работе у другого — только админ."""
+    user = message.from_user
+    if is_admin(user.id) and not is_moderator(user.id):
+        add_moderator(user.id, user.full_name, user.username, user.id)  # админ начал вести заявки сам
+    res = claim_lead(app["id"], user.id, user.full_name, take_over=is_admin(user.id))
+    if res is None:
+        await message.reply("Эта заявка в работе у другого менеджера — клиенту не отправлено. "
+                            "Попросите его передать заявку вам (кнопка «🔀 Передать»).")
+        return None
+    from notify import notify_admins, refresh_cards
+    await refresh_cards(bot, app["id"])  # откроет тему, если была закрыта, и обновит карточки
+    if res["prev_status"] in OPEN_STATUSES and res["prev_holder"]:
+        await post_in_topic(bot, app["id"], f"🔀 Заявку забрал себе: <b>{escape(user.full_name)}</b>")
+        with suppress(Exception):
+            await bot.send_message(res["prev_holder"], f"🔀 Заявку #{app['id']} забрал себе {escape(user.full_name)}.")
+    elif res["prev_status"] != "new":
+        await post_in_topic(bot, app["id"], f"♻️ Повторная обработка: заявку взял <b>{escape(user.full_name)}</b>")
+    if not is_admin(user.id):
+        await notify_admins(bot, f"👷 {escape(user.full_name)} взял заявку #{app['id']}, написав в теме.")
+    return get_application(app["id"])
 
 
 # ---------- кнопки статусов в теме ----------

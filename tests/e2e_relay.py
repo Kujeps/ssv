@@ -107,7 +107,7 @@ async def main():
     # ---------- права ----------
     w.clear(); await w.gmsg(99, G, thread, "я посторонний"); assert not w.to(21); ok("посторонний в теме: клиенту ничего не уходит")
     w.clear(); await w.gmsg(51, G, thread, "пишет другой менеджер")
-    assert not [s for s in w.to(21) if "другой" in (s["text"] or "")] and "закреплена за другим" in w.last_to(G)["text"]; ok("менеджер чужой заявки: клиенту не уходит, в теме пояснение")
+    assert not [s for s in w.to(21) if "другой" in (s["text"] or "")] and "в работе у другого менеджера" in w.last_to(G)["text"]; ok("менеджер чужой заявки: клиенту не уходит, в теме пояснение")
     w.clear(); await w.gpress(51, G, thread, "rt:1:agreed", card_mid := card["id"]); assert D.get_application(1)["status"] == "work"; ok("кнопки статусов чужой заявки не срабатывают")
 
     # ---------- кнопки статусов в теме ----------
